@@ -223,8 +223,8 @@ def run_benchmark(df: pd.DataFrame):
                          / max(1, len(result.trades)) * 100),
         })
 
-    # Sorrend: Calmar szerint csokkeno
-    rows.sort(key=lambda r: r["return_pct"], reverse=True)
+    # Sorrend: Calmar szerint csokkeno (drawdown-tudatos rang)
+    rows.sort(key=lambda r: r["calmar"], reverse=True)
 
     print(f"{'preset':<20} {'trades':>6} {'return':>10} "
           f"{'maxDD':>8} {'calmar':>8} {'win%':>6}")
@@ -235,7 +235,7 @@ def run_benchmark(df: pd.DataFrame):
               f"{r['calmar']:>8.2f} {r['win_rate']:>5.1f}%")
     print()
     best = rows[0]
-    print(f"Legjobb (HOZAM alapjan): {best['preset']}")
+    print(f"Legjobb (CALMAR alapjan): {best['preset']}")
     print(f"  hozam={best['return_pct']:+.2f}%  maxDD={best['max_dd_pct']:.1f}%  "
           f"calmar={best['calmar']:.2f}")
     return rows
