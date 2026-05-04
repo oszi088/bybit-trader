@@ -156,6 +156,10 @@ class Backtester:
             last_price = float(enriched.iloc[-1]["close"])
             cash = _close_position(position, last_price, enriched.index[-1], cash, cfg, bt_cfg, "end_of_data")
             trades.append(position)
+            # Equity curve utolsó pontjának frissítése az end_of_data zárás után,
+            # hogy equity_curve.iloc[-1] == final_balance legyen (konzisztens)
+            if equity_history:
+                equity_history[-1] = cash
 
         equity_curve = pd.Series(equity_history, index=enriched.index, name="equity")
         total_return_pct = (cash / cfg.initial_balance - 1) * 100
@@ -242,10 +246,13 @@ def walk_forward(
     bt = Backtester(agent)
     n = len(ohlcv)
     start = 0
-    while start + fold_size <= n:
-        chunk = ohlcv.iloc[start : start + fold_size]
+    while start < n:
+        end = min(start + fold_size, n)
+        chunk = ohlcv.iloc[start:end]
         if len(chunk) < 100:
             break
         result.folds.append(bt.run(chunk))
+        if end == n:
+            break   # elértük az adat végét
         start += step
     return result
