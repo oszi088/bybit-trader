@@ -279,12 +279,16 @@ class BybitBroker(Broker):
             order = self.exchange.create_market_buy_order(self.config.symbol, size)
             order_id = order.get("id")
             status = order.get("status", "unknown")
-            if status not in ("closed", "filled"):
+            # Bybit valós API-n "Filled" (nagybetűs), CCXT normalizálja → "closed"/"filled"
+            # Case-insensitive check a biztonság kedvéért
+            if status.lower() not in ("closed", "filled"):
                 logger.error("BUY order %s nem toltodott ki (status=%s) - pozicio nem nyilik",
                              order_id, status)
                 return None
             # Tényleges kitöltési ár (average fill) — NEM a request ár
-            fill_price = float(order.get("average") or order.get("price") or price)
+            # `or` helyett explicit None/0 ellenőrzés: average=0.0 helytelen fallbacket okozna
+            _avg = order.get("average")
+            fill_price = float(_avg) if _avg else (float(order.get("price") or price))
             logger.info("Bybit BUY order: %s (status=%s, fill=%.4f)", order_id, status, fill_price)
 
         # Helyi pozíció vezetése
@@ -311,7 +315,9 @@ class BybitBroker(Broker):
             order = self.exchange.create_market_sell_order(self.config.symbol, size)
             order_id = order.get("id")
             status = order.get("status", "unknown")
-            if status not in ("closed", "filled"):
+            # Bybit valós API-n "Filled" (nagybetűs), CCXT normalizálja → "closed"/"filled"
+            # Case-insensitive check a biztonság kedvéért
+            if status.lower() not in ("closed", "filled"):
                 logger.error("SELL order %s nem toltodott ki (status=%s) - pozicio nyitva marad",
                              order_id, status)
                 return None
