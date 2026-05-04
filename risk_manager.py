@@ -206,7 +206,9 @@ class RiskManager:
         Folyamatos equity-frissítés a drawdown védelemhez. Ha az equity
         a peak X%-a alá esik, halt állapotot kapcsolunk.
         """
-        if equity <= 0:
+        import math
+        if not math.isfinite(equity) or equity <= 0:
+            logger.warning("Érvénytelen equity érték: %s — drawdown check kihagyva.", equity)
             return
         if equity > self.state.peak_equity:
             self.state.peak_equity = equity
