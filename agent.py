@@ -9,9 +9,11 @@ from typing import Dict, Optional
 
 import pandas as pd
 
+from adaptive_strategy import CycleRegimeParams, get_params
 from config import TradingConfig
 from fear_greed import FearGreedReading, FearGreedSource
 from indicators import compute_all
+from market_cycle import CycleState, MarketCycle, MarketCycleDetector
 from ml_features import build_feature_matrix
 from ml_model import MLScore, MetaLabelModel
 from mtf import MTFAnalyzer, MTFReading
@@ -36,7 +38,9 @@ class Decision:
     mtf_score: float = 0.0
     mtf_signals: Dict[str, int] = field(default_factory=dict)
     reasons: Dict[str, int] = field(default_factory=dict)
-    ml_score: Optional[MLScore] = None    # meta-label konfidencia (ha van betanított modell)
+    ml_score: Optional[MLScore] = None       # meta-label konfidencia
+    cycle: Optional[CycleState] = None       # piaci ciklus állapot
+    cycle_params: Optional[CycleRegimeParams] = None  # adaptív paraméterek
 
     def explain(self) -> str:
         bullish = [n for n, s in self.reasons.items() if s > 0]
@@ -45,11 +49,16 @@ class Decision:
         if self.ml_score and self.ml_score.fitted:
             ml_part = (f" | ML p={self.ml_score.probability:.2f} "
                        f"bet={self.ml_score.bet_size:.2f}")
+        cycle_part = ""
+        if self.cycle:
+            cycle_part = (f" | cycle={self.cycle.cycle.value}"
+                          f"(conf={self.cycle.confidence:.2f}"
+                          f",rem~{self.cycle.days_remaining_est}d)")
         return (
             f"{self.action} @ {self.price:.2f} | score={self.score:+.2f} "
             f"| regime={self.regime} | F&G={self.fear_greed} "
             f"| MTF={self.mtf_label}({self.mtf_score:+.2f})"
-            f"{ml_part} | bullish={bullish} bearish={bearish}"
+            f"{ml_part}{cycle_part} | bullish={bullish} bearish={bearish}"
         )
 
 
@@ -57,13 +66,22 @@ class TradingAgent:
     def __init__(self, config: Optional[TradingConfig] = None,
                  fear_greed_source: Optional[FearGreedSource] = None,
                  mtf_analyzer: Optional[MTFAnalyzer] = None,
-                 ml_model: Optional[MetaLabelModel] = None):
+                 ml_model: Optional[MetaLabelModel] = None,
+                 cycle_detector: Optional[MarketCycleDetector] = None,
+                 cycle_state_path: Optional[str] = "data/cycle_state.json"):
         self.config = config or TradingConfig()
         self._enriched: Optional[pd.DataFrame] = None
         self._features: Optional[pd.DataFrame] = None
+        self._cycle_state: Optional[CycleState] = None
 
         # Meta-label ML modell (opcionális)
         self.ml: Optional[MetaLabelModel] = ml_model
+
+        # Piaci ciklus detektor
+        self.cycle_detector = cycle_detector or MarketCycleDetector(
+            state_path=cycle_state_path,
+            smoothing=3,
+        )
 
         # Fear & Greed forras
         if self.config.fear_greed.enabled:
@@ -146,10 +164,29 @@ class TradingAgent:
     # Publikus API
     # ------------------------------------------------------------------ #
 
-    def prepare(self, ohlcv: pd.DataFrame) -> pd.DataFrame:
+    def prepare(self, ohlcv: pd.DataFrame,
+                fg_value: int = 50,
+                funding_rate: float = 0.0,
+                btc_dominance: float = 50.0,
+                vix: float = 20.0) -> pd.DataFrame:
         self._enriched = compute_all(ohlcv, self.config.indicators)
         if self.ml is not None:
             self._features = build_feature_matrix(ohlcv, self.config.indicators)
+
+        # Piaci ciklus detektálás a teljes OHLCV history alapján
+        try:
+            self._cycle_state = self.cycle_detector.detect(
+                ohlcv=ohlcv,
+                fg_value=fg_value,
+                funding_rate=funding_rate,
+                btc_dominance=btc_dominance,
+                vix=vix,
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("agent").warning("Ciklus detektálás hiba: %s", e)
+            self._cycle_state = None
+
         return self._enriched
 
     def _current_fg(self) -> FearGreedReading:
@@ -182,12 +219,33 @@ class TradingAgent:
         )
         action = self._score_to_action(score, mtf_reading)
 
-        # Meta-label ML szűrő
+        # ── Ciklus-adaptív szűrők ────────────────────────────────────────
+        cycle_state = self._cycle_state
+        cycle_params: Optional[CycleRegimeParams] = None
+        if cycle_state is not None:
+            cycle_params = get_params(cycle_state.cycle)
+
+            # Irány-tilalom: ha a ciklus nem engedi az adott irányt
+            if action == "BUY"  and not cycle_params.allow_long:
+                action = "HOLD"
+            if action == "SELL" and not cycle_params.allow_short:
+                action = "HOLD"
+
+            # Score threshold módosítás (konzervatívabb / agresszívebb)
+            if action == "BUY":
+                effective_threshold = (self.config.buy_threshold
+                                       + cycle_params.score_threshold_delta)
+                if score < effective_threshold:
+                    action = "HOLD"
+
+        # ── Meta-label ML szűrő ──────────────────────────────────────────
         ml_score: Optional[MLScore] = None
         if self.ml is not None and self._features is not None:
             ml_score = self.ml.predict(self._features.iloc[[index]])
-            # Ha az ML nem magabiztos, a döntést HOLD-ra visszük
-            if action in ("BUY", "SELL") and not ml_score.is_confident:
+            # Ciklus-specifikus ML küszöb (ha nincs ciklus params, alap: 0.55)
+            min_prob = (cycle_params.min_ml_prob
+                        if cycle_params is not None else 0.55)
+            if action in ("BUY", "SELL") and ml_score.probability < min_prob:
                 action = "HOLD"
 
         return Decision(
@@ -202,6 +260,8 @@ class TradingAgent:
             mtf_signals=(mtf_reading.timeframe_signals if mtf_reading else {}),
             reasons=signals,
             ml_score=ml_score,
+            cycle=cycle_state,
+            cycle_params=cycle_params,
         )
 
     def decide(self, ohlcv: pd.DataFrame) -> Decision:
