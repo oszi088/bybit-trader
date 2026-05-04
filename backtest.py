@@ -90,11 +90,12 @@ class Backtester:
         just_exited_sl_tp = False
 
         # MTF: resample-eljuk a CSV-bol a magasabb timeframe-eket es feltoltjuk
-        # az analyzert (no look-ahead: az analyzer a sajat slice-eleseben dolgozik)
+        # az analyzert. Nincs lookahead: az mtf.analyze(as_of=timestamp) a baron
+        # belul csak az as_of-ig levo barokat latja (df[df.index <= as_of]).
         if self.agent.mtf is not None:
             for tf in self.agent.config.mtf.timeframes:
                 try:
-                    self.agent.mtf.set_data(tf, resample_ohlcv(ohlcv, tf))  # mtf_resample marker
+                    self.agent.mtf.set_data(tf, resample_ohlcv(ohlcv, tf))
                 except Exception:
                     pass
 
