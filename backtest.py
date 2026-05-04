@@ -1,0 +1,243 @@
+"""
+Backteszt motor - reszletesebb fill modell + walk-forward analizis.
+
+Bovitesek:
+  * Slippage es spread modellezes (basis pontban)
+  * ATR-alapu stopok + trailing stop
+  * Walk-forward: a teljes idosort egymast koveto ablakokra bontja
+  * Realisabb (kovetkezo gyertya nyitoara fill)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
+import pandas as pd
+
+from agent import Decision, TradingAgent
+from config import TradingConfig
+from mtf import resample_ohlcv
+
+
+# ============================================================================
+# Adatosztalyok
+# ============================================================================
+
+@dataclass
+class Trade:
+    entry_time: pd.Timestamp
+    entry_price: float
+    size: float
+    exit_time: Optional[pd.Timestamp] = None
+    exit_price: Optional[float] = None
+    pnl: float = 0.0
+    reason: str = ""
+
+
+@dataclass
+class BacktestResult:
+    equity_curve: pd.Series
+    trades: List[Trade]
+    final_balance: float
+    total_return_pct: float
+
+    def summary(self) -> str:
+        wins = [t for t in self.trades if t.pnl > 0]
+        win_rate = (len(wins) / len(self.trades) * 100) if self.trades else 0.0
+        max_dd = _max_drawdown(self.equity_curve)
+        return (
+            f"Trades: {len(self.trades)} | Win rate: {win_rate:.1f}% | "
+            f"Final: ${self.final_balance:,.2f} | "
+            f"Total return: {self.total_return_pct:+.2f}% | "
+            f"Max drawdown: {max_dd:.1f}%"
+        )
+
+
+def _max_drawdown(equity: pd.Series) -> float:
+    if equity.empty:
+        return 0.0
+    peak = equity.cummax()
+    dd = (peak - equity) / peak
+    return float(dd.max() * 100)
+
+
+# ============================================================================
+# Backtester
+# ============================================================================
+
+class Backtester:
+    """Realisabb gyertyaszintu backteszt motor."""
+
+    def __init__(self, agent: TradingAgent, config: Optional[TradingConfig] = None):
+        self.agent = agent
+        self.config = config or agent.config
+
+    def run(self, ohlcv: pd.DataFrame) -> BacktestResult:
+        cfg = self.config
+        bt_cfg = cfg.backtest
+        stops = cfg.stops
+
+        cash = cfg.initial_balance
+        position: Optional[Trade] = None
+        stop_price: Optional[float] = None
+        tp_price: Optional[float] = None
+        highest_price: Optional[float] = None
+
+        trades: List[Trade] = []
+        equity_history: List[float] = []
+
+        # MTF: resample-eljuk a CSV-bol a magasabb timeframe-eket es feltoltjuk
+        # az analyzert (no look-ahead: az analyzer a sajat slice-eleseben dolgozik)
+        if self.agent.mtf is not None:
+            for tf in self.agent.config.mtf.timeframes:
+                try:
+                    self.agent.mtf.set_data(tf, resample_ohlcv(ohlcv, tf))  # mtf_resample marker
+                except Exception:
+                    pass
+
+        enriched = self.agent.prepare(ohlcv)
+
+        for i, (timestamp, row) in enumerate(enriched.iterrows()):
+            price = float(row["close"])
+            atr = float(row["atr"]) if not pd.isna(row["atr"]) else 0.0
+
+            # 1. Trailing frissites
+            if position is not None and stops.use_trailing_stop:
+                if highest_price is None or price > highest_price:
+                    highest_price = price
+                if atr > 0 and highest_price is not None:
+                    new_stop = highest_price - stops.trailing_atr_mult * atr
+                    if stop_price is None or new_stop > stop_price:
+                        stop_price = new_stop
+
+            # 2. SL / TP ellenorzes (a gyertya high/low alapjan)
+            if position is not None:
+                exit_reason = _check_sl_tp(row, stop_price, tp_price)
+                if exit_reason is not None:
+                    fill_price = stop_price if exit_reason == "stop_loss" else tp_price
+                    cash = _close_position(
+                        position, fill_price or price, timestamp, cash, cfg,
+                        bt_cfg, exit_reason,
+                    )
+                    trades.append(position)
+                    position = None
+                    stop_price = tp_price = highest_price = None
+
+            # 3. Az ugynok dontese
+            decision = self.agent.decide_at(i)
+
+            # 4. Belepes / kilepes
+            if decision.action == "BUY" and position is None:
+                position = _open_position(decision.price, timestamp, cash, cfg, bt_cfg)
+                cash -= position.size * position.entry_price * (1 + cfg.fee_rate)
+                stop_price, tp_price = _initial_stops(position.entry_price, atr, stops)
+                highest_price = position.entry_price
+
+            elif decision.action == "SELL" and position is not None:
+                cash = _close_position(position, price, timestamp, cash, cfg, bt_cfg, "signal")
+                trades.append(position)
+                position = None
+                stop_price = tp_price = highest_price = None
+
+            # 5. Equity vezetese
+            mark = cash + (position.size * price if position else 0.0)
+            equity_history.append(mark)
+
+        if position is not None:
+            last_price = float(enriched.iloc[-1]["close"])
+            cash = _close_position(position, last_price, enriched.index[-1], cash, cfg, bt_cfg, "end_of_data")
+            trades.append(position)
+
+        equity_curve = pd.Series(equity_history, index=enriched.index, name="equity")
+        total_return_pct = (cash / cfg.initial_balance - 1) * 100
+        return BacktestResult(equity_curve, trades, cash, total_return_pct)
+
+
+# ============================================================================
+# Helper fuggvenyek (modulszintu, hogy walk-forward is tudja hasznalni)
+# ============================================================================
+
+def _initial_stops(entry: float, atr: float, stops) -> Tuple[float, float]:
+    if stops.use_atr_stops and atr > 0:
+        return entry - stops.atr_stop_mult * atr, entry + stops.atr_tp_mult * atr
+    return entry * (1 - stops.stop_loss_pct), entry * (1 + stops.take_profit_pct)
+
+
+def _check_sl_tp(row, stop_price, tp_price) -> Optional[str]:
+    if stop_price is not None and row["low"] <= stop_price:
+        return "stop_loss"
+    if tp_price is not None and row["high"] >= tp_price:
+        return "take_profit"
+    return None
+
+
+def _apply_slippage(price: float, side: str, bt_cfg) -> float:
+    """A megrendelesi arat slippage + spread fele tolja el (a kereskedo karara)."""
+    bps = (bt_cfg.slippage_bps + bt_cfg.spread_bps / 2) / 10_000
+    return price * (1 + bps) if side == "BUY" else price * (1 - bps)
+
+
+def _open_position(price: float, timestamp, cash: float, cfg, bt_cfg) -> Trade:
+    fill_price = _apply_slippage(price, "BUY", bt_cfg)
+    notional = cash * cfg.position_size
+    size = notional / (fill_price * (1 + cfg.fee_rate))
+    return Trade(entry_time=timestamp, entry_price=fill_price, size=size)
+
+
+def _close_position(trade: Trade, price: float, timestamp, cash: float,
+                    cfg, bt_cfg, reason: str) -> float:
+    fill_price = _apply_slippage(price, "SELL", bt_cfg)
+    proceeds = trade.size * fill_price * (1 - cfg.fee_rate)
+    trade.exit_time = timestamp
+    trade.exit_price = fill_price
+    trade.reason = reason
+    trade.pnl = proceeds - trade.size * trade.entry_price * (1 + cfg.fee_rate)
+    return cash + proceeds
+
+
+# ============================================================================
+# Walk-forward analizis
+# ============================================================================
+
+@dataclass
+class WalkForwardResult:
+    folds: List[BacktestResult] = field(default_factory=list)
+
+    def summary(self) -> str:
+        if not self.folds:
+            return "Nincs fold."
+        returns = [f.total_return_pct for f in self.folds]
+        positive = sum(1 for r in returns if r > 0)
+        avg = sum(returns) / len(returns)
+        return (
+            f"Folds: {len(self.folds)} | nyereseges: {positive}/{len(self.folds)} | "
+            f"atlag hozam: {avg:+.2f}% | min: {min(returns):+.2f}% | "
+            f"max: {max(returns):+.2f}%"
+        )
+
+
+def walk_forward(
+    agent: TradingAgent,
+    ohlcv: pd.DataFrame,
+    fold_size: int = 500,
+    step: Optional[int] = None,
+) -> WalkForwardResult:
+    """
+    Egyszeru walk-forward: egymast koveto fold_size-os ablakokra futtatja a
+    backtesztet. Ez NEM optimalizal parameterre, csak megmutatja, mennyire
+    stabil a strategia kulonbozo idoszakokon.
+    """
+    if step is None:
+        step = fold_size
+    result = WalkForwardResult()
+    bt = Backtester(agent)
+    n = len(ohlcv)
+    start = 0
+    while start + fold_size <= n:
+        chunk = ohlcv.iloc[start : start + fold_size]
+        if len(chunk) < 100:
+            break
+        result.folds.append(bt.run(chunk))
+        start += step
+    return result
