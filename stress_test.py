@@ -361,9 +361,7 @@ class StressTester:
                     proceeds = position_size * close * (1.0 - self.fee_rate)
                     pnl = proceeds - (position_size * entry_price * (1.0 + self.fee_rate))
                     trades.append({"pnl": pnl, "win": pnl > 0})
-                    cash = cash + proceeds - position_size * entry_price
-                    # korrigált cash a fee-vel
-                    cash = proceeds
+                    cash += proceeds
                     position_size = 0.0
                     logger.debug("[%s] Stop-loss @ %.2f (pnl: %+.2f)", scenario_name, close, pnl)
                     continue
@@ -373,7 +371,7 @@ class StressTester:
                     proceeds = position_size * close * (1.0 - self.fee_rate)
                     pnl = proceeds - (position_size * entry_price * (1.0 + self.fee_rate))
                     trades.append({"pnl": pnl, "win": pnl > 0})
-                    cash = proceeds
+                    cash += proceeds
                     position_size = 0.0
                     logger.debug("[%s] TP @ %.2f (pnl: %+.2f)", scenario_name, close, pnl)
                     continue
@@ -383,7 +381,7 @@ class StressTester:
                     proceeds = position_size * close * (1.0 - self.fee_rate)
                     pnl = proceeds - (position_size * entry_price * (1.0 + self.fee_rate))
                     trades.append({"pnl": pnl, "win": pnl > 0})
-                    cash = proceeds
+                    cash += proceeds
                     position_size = 0.0
                     logger.debug("[%s] SMA-zárás @ %.2f (pnl: %+.2f)", scenario_name, close, pnl)
 
