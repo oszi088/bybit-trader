@@ -13,6 +13,7 @@ from adaptive_strategy import CycleRegimeParams, get_params
 from altcoin_filter import AltseasonValidator, ValidationResult, CapTier, get_eligible_symbols
 from config import TradingConfig
 from market_timing import MarketTimingAnalyzer, TimingScore
+from override_engine import BlockReason, OverrideDecision, OverrideEngine, evaluate_override
 from fear_greed import FearGreedReading, FearGreedSource
 from indicators import compute_all
 from market_cycle import CycleState, MarketCycle, MarketCycleDetector
@@ -45,6 +46,7 @@ class Decision:
     cycle_params: Optional[CycleRegimeParams] = None      # adaptív paraméterek
     altseason_result: Optional[ValidationResult] = None   # valódi vs. false altseason
     timing: Optional[TimingScore] = None                  # időalapú aktivitás score
+    override: Optional[OverrideDecision] = None           # volt-e szabály felülírás
 
     def explain(self) -> str:
         bullish = [n for n, s in self.reasons.items() if s > 0]
@@ -62,11 +64,18 @@ class Decision:
         if self.timing:
             timing_part = (f" | timing={self.timing.trade_label}"
                            f"({self.timing.overall:.2f}×{self.timing.position_size_mult:.2f})")
+        override_part = ""
+        if self.override and self.override.triggered:
+            rules = [r.value for r in self.override.overridden_rules]
+            override_part = (f" | ⚠️OVERRIDE({','.join(rules)})"
+                             f"conv={self.override.conviction.total:.3f}"
+                             f"×{self.override.position_size_mult:.2f}")
         return (
             f"{self.action} @ {self.price:.2f} | score={self.score:+.2f} "
             f"| regime={self.regime} | F&G={self.fear_greed} "
             f"| MTF={self.mtf_label}({self.mtf_score:+.2f})"
-            f"{ml_part}{cycle_part}{timing_part} | bullish={bullish} bearish={bearish}"
+            f"{ml_part}{cycle_part}{timing_part}{override_part}"
+            f" | bullish={bullish} bearish={bearish}"
         )
 
 
@@ -234,7 +243,7 @@ class TradingAgent:
             return _FGR(50, "Disabled", datetime.now(timezone.utc))
         return self._fg.get()
 
-    def decide_at(self, index: int) -> Decision:
+    def decide_at(self, index: int, funding_rate: float = 0.0) -> Decision:
         if self._enriched is None:
             raise RuntimeError("Eloszor hivd meg a prepare(ohlcv) metodust.")
 
@@ -253,16 +262,6 @@ class TradingAgent:
                  __import__("datetime").datetime.now(_tz.utc))
         timing = self.timing_analyzer.score(ts_dt)
 
-        # Hard block: ha a timing teljesen blokkolja a kereskedést
-        if timing.hard_block:
-            return Decision(
-                action="HOLD", score=0.0,
-                price=float(row["close"]),
-                atr=float(row["atr"]) if not pd.isna(row["atr"]) else 0.0,
-                regime=regime.label, fear_greed=fg.value,
-                reasons=signals, timing=timing,
-            )
-
         # MTF analizis (csak ha be van kapcsolva)
         mtf_reading: Optional[MTFReading] = None
         if self.mtf is not None:
@@ -272,7 +271,21 @@ class TradingAgent:
             signals, regime.weights,
             mtf_score=(mtf_reading.composite_score if mtf_reading else 0.0),
         )
-        action = self._score_to_action(score, mtf_reading)
+
+        # Az eredeti szándékolt irány (mielőtt bármit blokkolnánk)
+        intended_action = self._score_to_action(score, mtf_reading)
+        action = intended_action
+        blocked_reasons: list[BlockReason] = []
+
+        # ── Timing blokkok ───────────────────────────────────────────────
+        if timing.hard_block and action in ("BUY", "SELL"):
+            blocked_reasons.append(BlockReason.TIMING_HARD)
+            action = "HOLD"
+        elif action in ("BUY", "SELL"):
+            effective_base = self.config.buy_threshold + timing.score_threshold_delta
+            if action == "BUY" and score < effective_base:
+                blocked_reasons.append(BlockReason.TIMING_THRESHOLD)
+                action = "HOLD"
 
         # ── Ciklus-adaptív szűrők ────────────────────────────────────────
         cycle_state = self._cycle_state
@@ -280,13 +293,15 @@ class TradingAgent:
         if cycle_state is not None:
             cycle_params = get_params(cycle_state.cycle)
 
-            # Irány-tilalom: ha a ciklus nem engedi az adott irányt
-            if action == "BUY"  and not cycle_params.allow_long:
+            # Irány-tilalom
+            if intended_action == "BUY" and not cycle_params.allow_long:
+                blocked_reasons.append(BlockReason.CYCLE_DIRECTION)
                 action = "HOLD"
-            if action == "SELL" and not cycle_params.allow_short:
+            if intended_action == "SELL" and not cycle_params.allow_short:
+                blocked_reasons.append(BlockReason.CYCLE_DIRECTION)
                 action = "HOLD"
 
-            # Score threshold módosítás — ciklus + timing együtt
+            # Score threshold (ciklus + timing összesítve, ha még nem volt blokk)
             if action == "BUY":
                 effective_threshold = (
                     self.config.buy_threshold
@@ -294,42 +309,38 @@ class TradingAgent:
                     + timing.score_threshold_delta
                 )
                 if score < effective_threshold:
+                    blocked_reasons.append(BlockReason.CYCLE_THRESHOLD)
                     action = "HOLD"
 
-        # ── Altseason szimbólum validáció ────────────────────────────────
-        # Ha altseason ciklusban vagyunk és ez a coin nem jogosult → HOLD
+        # ── Altseason validáció ──────────────────────────────────────────
         altseason_result = self._altseason_result
-        if (action == "BUY"
+        if (intended_action == "BUY"
                 and cycle_state is not None
                 and cycle_state.cycle.value == "altseason"
                 and cycle_params is not None
                 and cycle_params.altseason_validate):
 
             if altseason_result is None or not altseason_result.confirmed:
-                # False altseason → nem vásárlunk
+                blocked_reasons.append(BlockReason.ALTSEASON_FALSE)
                 action = "HOLD"
             elif self._symbol is not None:
-                # Valódi altseason: ellenőrizzük, hogy a coin jogosult-e
                 days_in = cycle_state.days_in_cycle
                 allowed_tiers: list[CapTier] = [CapTier.LARGE]
-                if days_in >= 14:
-                    allowed_tiers.append(CapTier.MID)
-                if days_in >= 30:
-                    allowed_tiers.append(CapTier.SMALL)
+                if days_in >= 14: allowed_tiers.append(CapTier.MID)
+                if days_in >= 30: allowed_tiers.append(CapTier.SMALL)
 
                 eligible = get_eligible_symbols(
                     min_halvings=cycle_params.altseason_min_halvings,
                     cap_tiers=allowed_tiers,
                 )
                 if self._symbol not in eligible:
-                    action = "HOLD"  # nem halving-túlélő vagy tier még nem nyílt meg
+                    blocked_reasons.append(BlockReason.ALTSEASON_TIER)
+                    action = "HOLD"
 
         # ── Meta-label ML szűrő ──────────────────────────────────────────
         ml_score: Optional[MLScore] = None
         if self.ml is not None and self._features is not None:
             ml_score = self.ml.predict(self._features.iloc[[index]])
-            # Ciklus-specifikus ML küszöb (ha nincs ciklus params, alap: 0.55)
-            # SMALL cap altseason esetén szigorúbb küszöb
             min_prob = cycle_params.min_ml_prob if cycle_params is not None else 0.55
             if (cycle_state is not None
                     and cycle_state.cycle.value == "altseason"
@@ -337,12 +348,32 @@ class TradingAgent:
                 from altcoin_filter import COIN_DB, CapTier as CT
                 coin_info = COIN_DB.get(self._symbol, {})
                 if coin_info.get("tier") == CT.SMALL:
-                    min_prob = max(min_prob, 0.65)  # small cap: szigorúbb ML küszöb
+                    min_prob = max(min_prob, 0.65)
                 elif coin_info.get("tier") == CT.MID:
                     min_prob = max(min_prob, 0.60)
 
-            if action in ("BUY", "SELL") and ml_score.probability < min_prob:
+            if intended_action in ("BUY", "SELL") and ml_score.probability < min_prob:
+                blocked_reasons.append(BlockReason.ML_PROBABILITY)
                 action = "HOLD"
+
+        # ── Override motor ───────────────────────────────────────────────
+        # Ha valami blokkolt, megvizsgáljuk, hogy az evidence elég erős-e
+        # az override-hoz. Az override sosem törli a stop-loss kötelezettséget
+        # és sosem növeli a max pozícióhoz képest.
+        override_dec: Optional[OverrideDecision] = None
+        if action == "HOLD" and blocked_reasons and intended_action != "HOLD":
+            override_dec = evaluate_override(
+                intended_action=intended_action,
+                blocked_reasons=blocked_reasons,
+                signals=signals,
+                score=score,
+                ml_prob=(ml_score.probability if ml_score is not None else None),
+                fg_value=fg.value,
+                row=row,
+                funding_rate=funding_rate,
+            )
+            if override_dec.triggered:
+                action = override_dec.action
 
         return Decision(
             action=action,
@@ -360,6 +391,7 @@ class TradingAgent:
             cycle_params=cycle_params,
             altseason_result=altseason_result,
             timing=timing,
+            override=override_dec,
         )
 
     def decide(self, ohlcv: pd.DataFrame) -> Decision:
