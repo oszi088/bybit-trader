@@ -86,6 +86,8 @@ class Backtester:
 
         trades: List[Trade] = []
         equity_history: List[float] = []
+        # SL/TP ütés után nem nyitunk újat ugyanazon a gyertyán (#7 fix)
+        just_exited_sl_tp = False
 
         # MTF: resample-eljuk a CSV-bol a magasabb timeframe-eket es feltoltjuk
         # az analyzert (no look-ahead: az analyzer a sajat slice-eleseben dolgozik)
@@ -101,6 +103,7 @@ class Backtester:
         for i, (timestamp, row) in enumerate(enriched.iterrows()):
             price = float(row["close"])
             atr = float(row["atr"]) if not pd.isna(row["atr"]) else 0.0
+            just_exited_sl_tp = False
 
             # 1. Trailing frissites
             if position is not None and stops.use_trailing_stop:
@@ -123,12 +126,16 @@ class Backtester:
                     trades.append(position)
                     position = None
                     stop_price = tp_price = highest_price = None
+                    just_exited_sl_tp = True   # nem nyitunk ugyanazon a gyertyán
 
             # 3. Az ugynok dontese
             decision = self.agent.decide_at(i)
 
             # 4. Belepes / kilepes
-            if decision.action == "BUY" and position is None:
+            # SL/TP utan ugyanazon a gyertyan nem lepunk be ujra: a gyertya
+            # high/low-ja mar lefutott, az uj belepesre valojaban bar i+1-en
+            # kerulne sor. Az azonnali ujrabelepes optimista backteszt torzitas.
+            if decision.action == "BUY" and position is None and not just_exited_sl_tp:
                 position = _open_position(decision.price, timestamp, cash, cfg, bt_cfg)
                 cash -= position.size * position.entry_price * (1 + cfg.fee_rate)
                 stop_price, tp_price = _initial_stops(position.entry_price, atr, stops)
