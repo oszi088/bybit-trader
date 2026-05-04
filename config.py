@@ -308,7 +308,8 @@ class SpotLiquidityConfig:
 class SpotCostConfig:
     """Kereskedesi koltseg modell spot tradinghez (cost_model.py)."""
     enabled: bool = True
-    fee_rate: float = 0.001                 # Bybit spot taker dij (0.10%)
+    # FIX #6: fee_rate-t a Trader mindig a TradingConfig.fee_rate-bol veszi at,
+    # ezt a mezot a _init_spot_modules() felulirja — ne allitsd be manualis!
     slippage_small_usd: float = 1_000.0    # ezalatt kis slippage becsles
     slippage_base_pct: float = 0.0003      # alap slippage (0.03%)
     slippage_impact_pct: float = 0.005     # piaci impact szorzo
@@ -336,6 +337,9 @@ class SpotDriftConfig:
     min_win_rate: float = 0.40
     min_profit_factor: float = 1.0
     min_edge_ratio: float = 0.80
+    # FIX #5: 0.0 = auto (a Trader _init_spot_modules szamitja a timeframe alapjan)
+    # Pl. 1h TF: 365*24=8760, 4h: 2190, 1d: 365
+    annualization_factor: float = 0.0  # 0 = auto kiszamitas a timeframe-bol
 
 
 # ============================================================================
@@ -399,6 +403,26 @@ class TradingConfig:
 # ============================================================================
 # Granularitas / scalping helperek
 # ============================================================================
+
+# FIX #5: Evi periodus szam timeframe-enkent (Sharpe annualizaciohoz).
+# Crypto 24/7 piac: 365 nap, nem 252 munkanap.
+TIMEFRAME_PERIODS_PER_YEAR: Dict[str, int] = {
+    "1m":  365 * 24 * 60,   # 525 600
+    "3m":  365 * 24 * 20,   # 175 200
+    "5m":  365 * 24 * 12,   # 105 120
+    "15m": 365 * 24 * 4,    #  35 040
+    "30m": 365 * 24 * 2,    #  17 520
+    "1h":  365 * 24,        #   8 760
+    "2h":  365 * 12,        #   4 380
+    "4h":  365 * 6,         #   2 190
+    "6h":  365 * 4,         #   1 460
+    "8h":  365 * 3,         #   1 095
+    "12h": 365 * 2,         #     730
+    "1d":  365,             #     365
+    "1w":  52,
+    "1M":  12,
+}
+
 
 # Hany masodperc varakozas iteraciok kozott egy adott timeframe-en.
 # Cel: a poll-ok finoman beleerjenek a gyertyak frissulesi ritmusaba,
