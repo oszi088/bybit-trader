@@ -33,7 +33,7 @@ from db import TradeDb
 from fear_greed import FearGreedSource
 from ml_model import MLConfig, MetaLabelModel
 from ml_train import run_training
-from optimizer import optimize
+from optimizer import optimize, DEFAULT_GRID, EXTENDED_GRID
 from portfolio import PortfolioTrader
 from trader import build_bybit_trader, build_paper_trader
 
@@ -139,24 +139,29 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     """Walk-forward grid search overfit-szuressel."""
     config = _build_config(args)
     df = load_csv(args.csv)
-    print(f"Adatok: {len(df)} gyertya")
+    print(f"Adatok: {len(df)} gyertya, {df.index.min()} -> {df.index.max()}")
+
+    grid = EXTENDED_GRID if args.extended else DEFAULT_GRID
+    grid_name = "EXTENDED" if args.extended else "DEFAULT"
+    print(f"Grid: {grid_name} | cel: {args.objective} | max_combos: {args.max_combinations}")
     print("Optimalizalas inditasa - ez perceket vehet...\n")
-    result = optimize(config, df)
 
-    print("\n=== OPTIMALIZALAS EREDMENY ===")
-    if result.default_score:
-        print("Default:")
-        print(f"  {result.default_score.summary()}\n")
+    result = optimize(
+        config,
+        df,
+        grid=grid,
+        max_combinations=args.max_combinations,
+        objective=args.objective,
+    )
+    result.print_report(top_n=args.top)
 
-    robust = result.robust_top(n=args.top)
-    if not robust:
-        print("Nincs olyan paramater-keszlet, ami mindket OOS foldon pozitiv.")
-        print("(A default sem, vagy a piaca vegig kihivasos.)")
-        return 0
+    best = result.best()
+    if best is None:
+        return 1
 
-    print(f"Top {len(robust)} robusztus parameter-keszlet (mindket OOS >= 0):")
-    for c in robust:
-        print(f"  {c.summary()}")
+    print("\nLegjobb parameter-keszlet alkalmazashoz:")
+    for k, v in best.params.items():
+        print(f"  {k} = {v}")
     return 0
 
 
@@ -373,7 +378,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeframe", default=None)
     p.add_argument("--endpoint", choices=["eu", "global", "testnet"], default=None)
     p.add_argument("--scalping", action="store_true")
-    p.add_argument("--top", type=int, default=5)
+    p.add_argument("--top", type=int, default=5,
+                   help="Hany legjobb jeloltet mutasson (default: 5)")
+    p.add_argument("--objective", choices=["return", "calmar"], default="return",
+                   help="Optimalizalasi cel: 'return' = max OOS hozam, "
+                        "'calmar' = max OOS Calmar (hozam/drawdown, stabil)")
+    p.add_argument("--extended", action="store_true",
+                   help="Kibovitett grid: + ATR stop/TP + poziciomeret "
+                        "(tobb kombinacio, lassabb)")
+    p.add_argument("--max-combinations", type=int, default=300,
+                   help="Max probalt parameter-kombinacio (default: 300)")
     p.set_defaults(func=cmd_optimize)
 
     p = sub.add_parser("paper")
