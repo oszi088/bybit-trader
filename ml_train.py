@@ -24,6 +24,7 @@ import pandas as pd
 from agent import TradingAgent
 from config import TradingConfig
 from data_source import load_csv
+from fear_greed_history import FearGreedHistory
 from ml_features import build_feature_matrix
 from ml_model import MLConfig, MetaLabelModel
 from triple_barrier import make_labels
@@ -72,7 +73,19 @@ def run_training(
 
     # 5. Elsődleges jelrendszer futtatása minden gyertyán
     logger.info("Elsődleges jelrendszer futtatása...")
-    agent = TradingAgent(cfg)
+
+    # Historikus F&G betöltése — lookahead bias megelőzése.
+    # A training loopban minden gyertyához a saját napjának F&G értékét
+    # keressük, NEM a live API aktuális értékét.
+    logger.info("Historikus Fear & Greed adatok betöltése...")
+    fg_history = FearGreedHistory.load()
+    date_min, date_max = fg_history.date_range()
+    if len(fg_history) > 0:
+        logger.info("  F&G history: %d nap (%s → %s)", len(fg_history), date_min, date_max)
+    else:
+        logger.warning("  F&G history üres — fallback 50 (Neutral) minden gyertyán.")
+
+    agent = TradingAgent(cfg, fg_history=fg_history)
     agent.prepare(ohlcv)
 
     primary = np.zeros(len(ohlcv), dtype=np.int8)

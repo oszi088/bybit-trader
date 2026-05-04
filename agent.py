@@ -15,6 +15,7 @@ from config import TradingConfig
 from market_timing import MarketTimingAnalyzer, TimingScore
 from override_engine import BlockReason, OverrideDecision, OverrideEngine, evaluate_override
 from fear_greed import FearGreedReading, FearGreedSource
+from fear_greed_history import FearGreedHistory
 from indicators import compute_all
 from market_cycle import CycleState, MarketCycle, MarketCycleDetector
 from ml_features import build_feature_matrix
@@ -82,6 +83,7 @@ class Decision:
 class TradingAgent:
     def __init__(self, config: Optional[TradingConfig] = None,
                  fear_greed_source: Optional[FearGreedSource] = None,
+                 fg_history: Optional[FearGreedHistory] = None,
                  mtf_analyzer: Optional[MTFAnalyzer] = None,
                  ml_model: Optional[MetaLabelModel] = None,
                  cycle_detector: Optional[MarketCycleDetector] = None,
@@ -93,6 +95,11 @@ class TradingAgent:
         self._cycle_state: Optional[CycleState] = None
         self._altseason_result: Optional[ValidationResult] = None
         self._symbol = symbol   # aktuálisan kereskedett szimbólum
+
+        # Historikus F&G lookup (ML train loophoz — lookahead mentesítés).
+        # Ha meg van adva: decide_at() a gyertya dátumához tartozó értéket
+        # keresi, NEM a live API-t hívja.
+        self._fg_history: Optional[FearGreedHistory] = fg_history
 
         # Meta-label ML modell (opcionális)
         self.ml: Optional[MetaLabelModel] = ml_model
@@ -237,11 +244,34 @@ class TradingAgent:
         return self._enriched
 
     def _current_fg(self) -> FearGreedReading:
+        """Live F&G – csak élő kereskedésnél. Training-ben _fg_for_ts()-t használj."""
         if self._fg is None:
             from fear_greed import FearGreedReading as _FGR
             from datetime import datetime, timezone
             return _FGR(50, "Disabled", datetime.now(timezone.utc))
         return self._fg.get()
+
+    def _fg_for_ts(self, timestamp) -> int:
+        """
+        Lookahead-mentes F&G érték lekérése.
+
+        Ha van historikus adatforrás (fg_history), a gyertya dátumához
+        tartozó értéket adja vissza — training loopban ezt kell hívni.
+        Ha nincs (élő kereskedés), a live API-t hívja meg.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        if self._fg_history is not None:
+            # Historikus lookup: a timestamp dátumából keresi az értéket
+            if hasattr(timestamp, "to_pydatetime"):
+                ts_dt = timestamp.to_pydatetime()
+            elif isinstance(timestamp, _dt):
+                ts_dt = timestamp
+            else:
+                ts_dt = _dt.now(_tz.utc)
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=_tz.utc)
+            return self._fg_history.get_value_for_ts(ts_dt)
+        return self._current_fg().value
 
     def decide_at(self, index: int, funding_rate: float = 0.0) -> Decision:
         if self._enriched is None:
@@ -252,7 +282,11 @@ class TradingAgent:
         prev_obv = self._enriched["obv"].iloc[index - 1] if index > 0 else None
 
         regime: RegimeReading = detect_regime(row, self.config.regime)
-        fg = self._current_fg()
+        fg_value = self._fg_for_ts(timestamp)
+        # FearGreedReading csak a teljes Decision objektumhoz kell (fear_greed mező)
+        from fear_greed import FearGreedReading as _FGR
+        from datetime import datetime as _dt, timezone as _tz
+        fg = _FGR(fg_value, "", _dt.now(_tz.utc))
         signals = self._gather_signals(row, prev_obv, fg.value)
 
         # ── Időalapú timing score ────────────────────────────────────────
