@@ -294,7 +294,7 @@ def apply_to_config(config, params: CycleRegimeParams) -> None:
 
     # Buy/Sell küszöb módosítása
     config.buy_threshold  = config.buy_threshold  + params.score_threshold_delta
-    config.sell_threshold = config.sell_threshold - params.score_threshold_delta
+    config.sell_threshold = config.sell_threshold + params.score_threshold_delta
 
     # Max holding
     if hasattr(config, "max_holding_bars"):
