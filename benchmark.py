@@ -30,11 +30,11 @@ logging.disable(logging.CRITICAL)
 
 def generate_multi_regime(seed: int = 42) -> pd.DataFrame:
     """
-    5000 1h gyertya, 4 fazisban:
-      0..1500    : bull   (drift +0.0008, sigma 0.012)
-      1500..3000 : range  (drift 0,        sigma 0.015)
-      3000..4000 : bear   (drift -0.0010, sigma 0.020)
-      4000..5000 : recovery (drift +0.0012, sigma 0.014)
+    2000 1h gyertya, 4 fazisban:
+      0..500    : bull      (drift +0.0008, sigma 0.012)
+      500..1000 : range     (drift  0.0000, sigma 0.015)
+      1000..1500: bear      (drift -0.0010, sigma 0.020)
+      1500..2000: recovery  (drift +0.0012, sigma 0.014)
     """
     np.random.seed(seed)
 
