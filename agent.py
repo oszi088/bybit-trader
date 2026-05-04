@@ -10,6 +10,7 @@ from typing import Dict, Optional
 import pandas as pd
 
 from adaptive_strategy import CycleRegimeParams, get_params
+from altcoin_filter import AltseasonValidator, ValidationResult, CapTier, get_eligible_symbols
 from config import TradingConfig
 from fear_greed import FearGreedReading, FearGreedSource
 from indicators import compute_all
@@ -38,9 +39,10 @@ class Decision:
     mtf_score: float = 0.0
     mtf_signals: Dict[str, int] = field(default_factory=dict)
     reasons: Dict[str, int] = field(default_factory=dict)
-    ml_score: Optional[MLScore] = None       # meta-label konfidencia
-    cycle: Optional[CycleState] = None       # piaci ciklus állapot
-    cycle_params: Optional[CycleRegimeParams] = None  # adaptív paraméterek
+    ml_score: Optional[MLScore] = None                    # meta-label konfidencia
+    cycle: Optional[CycleState] = None                    # piaci ciklus állapot
+    cycle_params: Optional[CycleRegimeParams] = None      # adaptív paraméterek
+    altseason_result: Optional[ValidationResult] = None   # valódi vs. false altseason
 
     def explain(self) -> str:
         bullish = [n for n, s in self.reasons.items() if s > 0]
@@ -68,11 +70,14 @@ class TradingAgent:
                  mtf_analyzer: Optional[MTFAnalyzer] = None,
                  ml_model: Optional[MetaLabelModel] = None,
                  cycle_detector: Optional[MarketCycleDetector] = None,
-                 cycle_state_path: Optional[str] = "data/cycle_state.json"):
+                 cycle_state_path: Optional[str] = "data/cycle_state.json",
+                 symbol: Optional[str] = None):
         self.config = config or TradingConfig()
         self._enriched: Optional[pd.DataFrame] = None
         self._features: Optional[pd.DataFrame] = None
         self._cycle_state: Optional[CycleState] = None
+        self._altseason_result: Optional[ValidationResult] = None
+        self._symbol = symbol   # aktuálisan kereskedett szimbólum
 
         # Meta-label ML modell (opcionális)
         self.ml: Optional[MetaLabelModel] = ml_model
@@ -82,6 +87,13 @@ class TradingAgent:
             state_path=cycle_state_path,
             smoothing=3,
         )
+
+        # Alt szezon validátor
+        altseason_state = (
+            cycle_state_path.replace("cycle_state.json", "altseason_state.json")
+            if cycle_state_path else None
+        )
+        self.altseason_validator = AltseasonValidator(state_path=altseason_state)
 
         # Fear & Greed forras
         if self.config.fear_greed.enabled:
@@ -168,10 +180,14 @@ class TradingAgent:
                 fg_value: int = 50,
                 funding_rate: float = 0.0,
                 btc_dominance: float = 50.0,
+                eth_btc_ratio: Optional[float] = None,
                 vix: float = 20.0) -> pd.DataFrame:
         self._enriched = compute_all(ohlcv, self.config.indicators)
         if self.ml is not None:
             self._features = build_feature_matrix(ohlcv, self.config.indicators)
+
+        import logging as _log
+        _logger = _log.getLogger("agent")
 
         # Piaci ciklus detektálás a teljes OHLCV history alapján
         try:
@@ -183,9 +199,22 @@ class TradingAgent:
                 vix=vix,
             )
         except Exception as e:
-            import logging
-            logging.getLogger("agent").warning("Ciklus detektálás hiba: %s", e)
+            _logger.warning("Ciklus detektálás hiba: %s", e)
             self._cycle_state = None
+
+        # Alt szezon validáció (csak ha a ciklus azt mutatja)
+        self._altseason_result = None
+        if (self._cycle_state is not None
+                and self._cycle_state.cycle.value == "altseason"):
+            try:
+                self._altseason_result = self.altseason_validator.validate(
+                    ohlcv_btc=ohlcv,
+                    btc_dominance=btc_dominance,
+                    eth_btc_ratio=eth_btc_ratio,
+                    vix=vix,
+                )
+            except Exception as e:
+                _logger.warning("Altseason validáció hiba: %s", e)
 
         return self._enriched
 
@@ -238,13 +267,51 @@ class TradingAgent:
                 if score < effective_threshold:
                     action = "HOLD"
 
+        # ── Altseason szimbólum validáció ────────────────────────────────
+        # Ha altseason ciklusban vagyunk és ez a coin nem jogosult → HOLD
+        altseason_result = self._altseason_result
+        if (action == "BUY"
+                and cycle_state is not None
+                and cycle_state.cycle.value == "altseason"
+                and cycle_params is not None
+                and cycle_params.altseason_validate):
+
+            if altseason_result is None or not altseason_result.confirmed:
+                # False altseason → nem vásárlunk
+                action = "HOLD"
+            elif self._symbol is not None:
+                # Valódi altseason: ellenőrizzük, hogy a coin jogosult-e
+                days_in = cycle_state.days_in_cycle
+                allowed_tiers: list[CapTier] = [CapTier.LARGE]
+                if days_in >= 14:
+                    allowed_tiers.append(CapTier.MID)
+                if days_in >= 30:
+                    allowed_tiers.append(CapTier.SMALL)
+
+                eligible = get_eligible_symbols(
+                    min_halvings=cycle_params.altseason_min_halvings,
+                    cap_tiers=allowed_tiers,
+                )
+                if self._symbol not in eligible:
+                    action = "HOLD"  # nem halving-túlélő vagy tier még nem nyílt meg
+
         # ── Meta-label ML szűrő ──────────────────────────────────────────
         ml_score: Optional[MLScore] = None
         if self.ml is not None and self._features is not None:
             ml_score = self.ml.predict(self._features.iloc[[index]])
             # Ciklus-specifikus ML küszöb (ha nincs ciklus params, alap: 0.55)
-            min_prob = (cycle_params.min_ml_prob
-                        if cycle_params is not None else 0.55)
+            # SMALL cap altseason esetén szigorúbb küszöb
+            min_prob = cycle_params.min_ml_prob if cycle_params is not None else 0.55
+            if (cycle_state is not None
+                    and cycle_state.cycle.value == "altseason"
+                    and self._symbol is not None):
+                from altcoin_filter import COIN_DB, CapTier as CT
+                coin_info = COIN_DB.get(self._symbol, {})
+                if coin_info.get("tier") == CT.SMALL:
+                    min_prob = max(min_prob, 0.65)  # small cap: szigorúbb ML küszöb
+                elif coin_info.get("tier") == CT.MID:
+                    min_prob = max(min_prob, 0.60)
+
             if action in ("BUY", "SELL") and ml_score.probability < min_prob:
                 action = "HOLD"
 
@@ -262,6 +329,7 @@ class TradingAgent:
             ml_score=ml_score,
             cycle=cycle_state,
             cycle_params=cycle_params,
+            altseason_result=altseason_result,
         )
 
     def decide(self, ohlcv: pd.DataFrame) -> Decision:

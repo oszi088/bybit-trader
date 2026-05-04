@@ -25,8 +25,8 @@ Adaptált paraméterek kategóriái:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 from market_cycle import MarketCycle
 
@@ -69,6 +69,13 @@ class CycleRegimeParams:
 
     # --- Buy threshold módosító ---
     score_threshold_delta: float  # +x → nehezebben vesz, −x → könnyebben
+
+    # --- Altseason-specifikus coin szűrő ---
+    # Ha nem None: csak ezeket a symbolokat engedélyezi (altseason whitelist)
+    # None = nincs szűrés (bármely coin mehet)
+    altseason_validate: bool = False   # kötelező-e AltseasonValidator átmenni
+    altseason_min_halvings: int = 1    # min halvings a coin-hoz
+    altseason_cap_tiers: List[str] = field(default_factory=list)  # ["large","mid","small"]
 
     # --- Leírás (logging) ---
     note: str = ""
@@ -218,22 +225,29 @@ CYCLE_PARAMS: Dict[MarketCycle, CycleRegimeParams] = {
 
     # ─── ALTSEASON ───────────────────────────────────────────────────────────
     # BTC dominancia zuhan, alts felülteljesítenek. Momentum extrém.
-    # Gyorsabb profit-vétel, mert hirtelen véget érhet.
+    # KÖTELEZŐ: AltseasonValidator megerősítése (false altseason kiszűrés).
+    # Csak halving-túlélő coinok engedélyezve, cap tier szerint fokozatosan:
+    #   Első 14 nap:  csak LARGE cap
+    #   14-30 nap:    LARGE + MID cap
+    #   30+ nap:      LARGE + MID + SMALL (magasabb ML küszöb mellett)
     MarketCycle.ALTSEASON: CycleRegimeParams(
-        max_position_pct       = 0.20,
-        kelly_cap              = 0.40,
-        atr_stop_mult          = 2.0,
-        atr_tp_mult            = 4.0,
-        max_holding_bars       = 20,
-        min_ml_prob            = 0.57,
-        allow_long             = True,
-        allow_short            = False,
-        momentum_mult          = 1.8,   # extrém momentum
-        mean_reversion_mult    = 0.4,
-        volume_mult            = 1.6,
-        funding_contrarian_mult= 2.0,   # alt funding nagyon magas lehet
-        score_threshold_delta  = -0.03,
-        note="Altseason — alt momentum, gyors TP, BTC dom csökkenés figyeld",
+        max_position_pct           = 0.20,
+        kelly_cap                  = 0.40,
+        atr_stop_mult              = 2.0,
+        atr_tp_mult                = 4.0,
+        max_holding_bars           = 20,
+        min_ml_prob                = 0.57,
+        allow_long                 = True,
+        allow_short                = False,
+        momentum_mult              = 1.8,   # extrém momentum
+        mean_reversion_mult        = 0.4,
+        volume_mult                = 1.6,
+        funding_contrarian_mult    = 2.0,   # alt funding nagyon magas lehet
+        score_threshold_delta      = -0.03,
+        altseason_validate         = True,  # KÖTELEZŐ AltseasonValidator
+        altseason_min_halvings     = 1,     # legalább 1 halving túlélve
+        altseason_cap_tiers        = ["large"],  # default: csak large (bővül idővel)
+        note="Altseason — CSAK validált, halving-túlélő altok | cap tier fokozatos",
     ),
 
     # ─── RISK_OFF ────────────────────────────────────────────────────────────
