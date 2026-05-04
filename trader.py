@@ -191,7 +191,13 @@ class Trader:
     # ------------------------------------------------------------------ #
 
     def _try_open(self, decision: Decision, timestamp: pd.Timestamp) -> None:
-        ok, reason = self.risk.should_open(decision.price, size=1.0, atr=decision.atr)
+        # Tényleges szándékolt pozícióméret coinban — ezt ellenőrzi a risk gate
+        _equity = self.broker.equity(decision.price)
+        _size_coins = (
+            _equity * self.config.position_size / decision.price
+            if decision.price > 0 else 0.0
+        )
+        ok, reason = self.risk.should_open(decision.price, size=_size_coins, atr=decision.atr)
         if not ok:
             logger.info("BUY visszautasítva (risk): %s", reason)
             if "halted" in reason and self.config.notify.notify_on_kill_switch:
@@ -293,7 +299,7 @@ class Trader:
         size = size_usd / decision.price if decision.price > 0 else 0.0
         if size <= 0:
             return
-        report = self.broker.buy(decision.price, timestamp)
+        report = self.broker.buy(decision.price, timestamp, size=size)
         if report:
             self.db.log_fill(
                 self.config.symbol, "BUY", report.size, report.price,
