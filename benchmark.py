@@ -6,6 +6,17 @@ mint egy kozepesen jo, de stabil.
 
 A szintetikus idosor 4 szakaszbol all:
   bull (felfele trend) -> range (oldalazas) -> bear (drawdown) -> recovery
+
+FONTOS: minden preset ertelmes elteres a DEFAULT config-hoz kepest.
+Jelenlegi default ertekek (amitol a presets elternek):
+  atr_stop_mult     = 3.0
+  atr_tp_mult       = 5.0
+  use_trailing_stop = False
+  buy_threshold     = 0.40
+  sell_threshold    = -0.40
+  position_size     = 0.95
+  max_atr_pct       = 0.05  (relatív ATR szuro)
+  score_prop_size   = True  (Kelly-szeru meretezes)
 """
 
 from __future__ import annotations
@@ -73,106 +84,149 @@ def _no_op(cfg):
     pass
 
 
+# --- ATR stop/TP ---
+# default: stop=3.0, tp=5.0
+
 def _atr_tight(cfg):
+    """Szoros stop: 1.5×ATR stop, 4×ATR TP (default: 3.0 / 5.0)"""
     cfg.stops.atr_stop_mult = 1.5
     cfg.stops.atr_tp_mult = 4.0
 
 
 def _atr_loose(cfg):
-    cfg.stops.atr_stop_mult = 3.0
-    cfg.stops.atr_tp_mult = 5.0
+    """Tág stop: 4.5×ATR stop, 8×ATR TP (default: 3.0 / 5.0)"""
+    cfg.stops.atr_stop_mult = 4.5
+    cfg.stops.atr_tp_mult = 8.0
 
 
-def _no_trailing(cfg):
-    cfg.stops.use_trailing_stop = False
+# --- Trailing stop ---
+# default: use_trailing_stop = False
 
+def _with_trailing(cfg):
+    """Trailing stop bekapcsolva (default: False)"""
+    cfg.stops.use_trailing_stop = True
+
+
+# --- MTF — engedélyezni kell, mert benchmark alapból kikapcsolja ---
 
 def _mtf_gate(cfg):
+    """MTF gate mód: csak akkor lép be, ha a higher TF megerősít (default: MTF off)"""
+    cfg.mtf.enabled = True
     cfg.mtf.mode = "gate"
     cfg.mtf.gate_threshold = 0.2
 
 
 def _mtf_strong(cfg):
+    """MTF weighted mód: 2.5× higher TF súly (default: MTF off)"""
+    cfg.mtf.enabled = True
     cfg.mtf.mode = "weighted"
     cfg.mtf.composite_weight = 2.5
 
 
+# --- Volatilitás szűrő ---
+# default: max_atr_pct = 0.05
+
 def _vol_strict(cfg):
+    """Szigorú ATR szűrő: 2.5% relatív ATR felett nem lép be (default: 5%)"""
     cfg.risk.max_atr_pct = 0.025
 
 
+# --- Pozícióméretezés ---
+# default: score_proportional_size = True, position_size = 0.95
+
 def _no_kelly(cfg):
+    """Fix pozícióméret: nem skálázza a score alapján (default: score-arányos)"""
     cfg.risk.score_proportional_size = False
 
 
 def _conservative_size(cfg):
+    """Félakkora pozíció: position_size = 0.5 (default: 0.95)"""
     cfg.position_size = 0.5
 
 
-def _high_threshold(cfg):
-    cfg.buy_threshold = 0.40
-    cfg.sell_threshold = -0.40
+# --- Belépési küszöb ---
+# default: buy_threshold = 0.40, sell_threshold = -0.40
 
+def _high_threshold(cfg):
+    """Magasabb küszöb: ±0.55 (default: ±0.40) — ritkább, de meggyőzőbb belépés"""
+    cfg.buy_threshold = 0.55
+    cfg.sell_threshold = -0.55
+
+
+def _low_threshold(cfg):
+    """Alacsonyabb küszöb: ±0.25 (default: ±0.40) — több trade, de gyengébb jel"""
+    cfg.buy_threshold = 0.25
+    cfg.sell_threshold = -0.25
+
+
+# --- Súlyrendszer / rezsim ---
 
 def _trend_only(cfg):
+    """Rezsim detektor ki, fix TREND súlyok (SMA/EMA/MACD dominál)"""
     cfg.regime.enabled = False
     cfg.weights = dict(TREND_WEIGHTS)
 
 
 def _range_only(cfg):
+    """Rezsim detektor ki, fix RANGE súlyok (RSI/BB/Stoch dominál)"""
     cfg.regime.enabled = False
     cfg.weights = dict(RANGE_WEIGHTS)
 
 
 PRESETS = [
     Preset("default",          _no_op),
-    Preset("atr_tight",        _atr_tight),
-    Preset("atr_loose",        _atr_loose),
-    Preset("no_trailing",      _no_trailing),
-    Preset("mtf_gate",         _mtf_gate),
-    Preset("mtf_strong",       _mtf_strong),
-    Preset("vol_strict",       _vol_strict),
-    Preset("no_kelly",         _no_kelly),
-    Preset("conservative_50%", _conservative_size),
-    Preset("high_threshold",   _high_threshold),
+    Preset("atr_tight",        _atr_tight),        # stop: 1.5 / tp: 4.0
+    Preset("atr_loose",        _atr_loose),        # stop: 4.5 / tp: 8.0
+    Preset("with_trailing",    _with_trailing),    # trailing: True
+    Preset("mtf_gate",         _mtf_gate),         # MTF gate on
+    Preset("mtf_strong",       _mtf_strong),       # MTF weighted on
+    Preset("vol_strict",       _vol_strict),       # max_atr_pct: 2.5%
+    Preset("no_kelly",         _no_kelly),         # fix pozícióméret
+    Preset("conservative_50%", _conservative_size),# pos_size: 0.5
+    Preset("high_threshold",   _high_threshold),   # küszöb: ±0.55
+    Preset("low_threshold",    _low_threshold),    # küszöb: ±0.25
     Preset("trend_only",       _trend_only),
     Preset("range_only",       _range_only),
 ]
 
 
-
-
 # --- Kombinalt preset-ek (drawdown-tudatos) ---
 
 def _ht_atr_loose(cfg):
-    cfg.buy_threshold = 0.40; cfg.sell_threshold = -0.40
-    cfg.stops.atr_stop_mult = 3.0; cfg.stops.atr_tp_mult = 5.0
+    """Magas küszöb (0.55) + tág ATR stop (4.5/8.0)"""
+    cfg.buy_threshold = 0.55; cfg.sell_threshold = -0.55
+    cfg.stops.atr_stop_mult = 4.5; cfg.stops.atr_tp_mult = 8.0
 
 
 def _ht_conservative(cfg):
-    cfg.buy_threshold = 0.40; cfg.sell_threshold = -0.40
+    """Magas küszöb (0.55) + kis pozíció (0.5)"""
+    cfg.buy_threshold = 0.55; cfg.sell_threshold = -0.55
     cfg.position_size = 0.5
 
 
 def _ht_atr_conservative(cfg):
-    cfg.buy_threshold = 0.40; cfg.sell_threshold = -0.40
-    cfg.stops.atr_stop_mult = 3.0; cfg.stops.atr_tp_mult = 5.0
+    """Magas küszöb (0.55) + tág ATR (4.5/8.0) + kis pozíció (0.5)"""
+    cfg.buy_threshold = 0.55; cfg.sell_threshold = -0.55
+    cfg.stops.atr_stop_mult = 4.5; cfg.stops.atr_tp_mult = 8.0
     cfg.position_size = 0.5
 
 
 def _trend_high_thr(cfg):
+    """TREND súlyok + magas küszöb (0.55)"""
     cfg.regime.enabled = False
     cfg.weights = dict(TREND_WEIGHTS)
-    cfg.buy_threshold = 0.40; cfg.sell_threshold = -0.40
+    cfg.buy_threshold = 0.55; cfg.sell_threshold = -0.55
 
 
 def _trend_atr_loose(cfg):
+    """TREND súlyok + tág ATR stop (4.5/8.0)"""
     cfg.regime.enabled = False
     cfg.weights = dict(TREND_WEIGHTS)
-    cfg.stops.atr_stop_mult = 3.0; cfg.stops.atr_tp_mult = 5.0
+    cfg.stops.atr_stop_mult = 4.5; cfg.stops.atr_tp_mult = 8.0
 
 
 def _trend_conservative(cfg):
+    """TREND súlyok + kis pozíció (0.5)"""
     cfg.regime.enabled = False
     cfg.weights = dict(TREND_WEIGHTS)
     cfg.position_size = 0.5
