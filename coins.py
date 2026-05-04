@@ -77,7 +77,7 @@ SMALL_CAP: List[str] = [
     "RUNE/USDT",
     "ZIL/USDT",
     "ONE/USDT",
-    "FTM/USDT",
+    "S/USDT",       # Sonic (korábbi FTM/Fantom → token migration 2024)
     "ROSE/USDT",
     "BAT/USDT",
     "LRC/USDT",

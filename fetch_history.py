@@ -170,7 +170,8 @@ def to_dataframe(rows: List[list]) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     if df.empty:
         return df
-    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    # keep="last": batch határon az exchange újraküldheti a gyertyát frissebb adattal
+    df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
     return df
 
 

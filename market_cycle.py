@@ -310,7 +310,7 @@ class MarketCycleDetector:
             self._current = detected
             self._current_since = as_of
 
-        days_in = (as_of - self._current_since).days if self._current_since else 0
+        days_in = max(0, (as_of - self._current_since).days) if self._current_since else 0
 
         _, _, avg_dur = CYCLE_DURATIONS[detected]
         remaining = max(0, avg_dur - days_in)
