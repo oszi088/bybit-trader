@@ -126,6 +126,15 @@ class PortfolioTrader:
         # Nyitott poziciok listaja portfolio kockazat ellenorzeshez
         open_symbols = [t.config.symbol for t in self.traders if t.broker.in_position]
 
+        # FIX #7: valódi hozamadatok összegyűjtése az előző iteráció OHLCV-jéből.
+        # Az _last_returns az előző step() hívásban töltődik fel → 1 iteráció késés,
+        # ami portfolio döntésnél teljesen elfogadható.
+        returns_dict = {
+            t.config.symbol: t._last_returns
+            for t in self.traders
+            if getattr(t, "_last_returns", [])
+        }
+
         for t in self.traders:
             # Ha a portfolio mar tele van, ne nyithasson uj poziciot;
             # de a meglevoket le tudja zarni (SL/TP/SELL signal)
@@ -133,12 +142,12 @@ class PortfolioTrader:
                     and self.open_positions >= self.max_open_positions):
                 continue
 
-            # Portfolio-szintu kockazat ellenorzes uj belep?snel
+            # Portfolio-szintu kockazat ellenorzes uj belepes elott
             if not t.broker.in_position and self._portfolio_risk:
                 risk_result = self._portfolio_risk.check_new_position(
-                    symbol           = t.config.symbol,
-                    open_symbols     = open_symbols,
-                    returns_dict     = {},   # TODO: visszatekinto hozamok betoltese
+                    symbol              = t.config.symbol,
+                    open_symbols        = open_symbols,
+                    returns_dict        = returns_dict,   # FIX #7: valós hozamok
                     total_portfolio_usd = self.base_config.initial_balance,
                     new_position_usd    = self.base_config.risk.max_order_value_usd,
                 )
