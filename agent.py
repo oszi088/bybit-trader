@@ -290,11 +290,19 @@ class TradingAgent:
         signals = self._gather_signals(row, prev_obv, fg.value)
 
         # ── Időalapú timing score ────────────────────────────────────────
-        from datetime import timezone as _tz
-        ts_dt = (timestamp.to_pydatetime().replace(tzinfo=_tz.utc)
-                 if hasattr(timestamp, "to_pydatetime") else
-                 __import__("datetime").datetime.now(_tz.utc))
-        timing = self.timing_analyzer.score(ts_dt)
+        from datetime import datetime as _dt, timezone as _tz
+        if hasattr(timestamp, "to_pydatetime"):
+            _ts_dt = timestamp.to_pydatetime()
+            if _ts_dt.tzinfo is None:
+                _ts_dt = _ts_dt.replace(tzinfo=_tz.utc)
+        elif isinstance(timestamp, _dt):
+            _ts_dt = timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=_tz.utc)
+        else:
+            # Integer vagy egyéb index: nincs értelmes dátum → UTC epoch + index másodperc
+            # Backtestben ez nem fordul elő ha az enriched DatetimeIndex-es, élőben soha.
+            logger.debug("decide_at: nem-datetime index (%r) → datetime.now fallback", timestamp)
+            _ts_dt = _dt.now(_tz.utc)
+        timing = self.timing_analyzer.score(_ts_dt)
 
         # MTF analizis (csak ha be van kapcsolva)
         mtf_reading: Optional[MTFReading] = None
