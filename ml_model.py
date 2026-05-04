@@ -245,8 +245,20 @@ class MetaLabelModel:
             )
 
         # ── 3. Meta-learner tanítása OOF prob-okon ────────────────────
-        oof_X = np.column_stack(list(oof_probs.values()))  # (n, n_models)
-        self._meta_clf = self._fit_meta(oof_X, y_f.values)
+        oof_matrix = np.column_stack(list(oof_probs.values()))  # (n, n_models)
+
+        # Csak azokat a sorokat adjuk a meta-learnernek, amelyek minden
+        # base modelltől valódi OOF predikciót kaptak (nem az inicializáló NaN-t).
+        # Az első fold tipikusan nem kap OOF predikciót (nincs előtte train adat).
+        filled_mask = ~np.any(np.isnan(oof_matrix), axis=1)
+        n_filled = filled_mask.sum()
+        if n_filled < 50:
+            logger.warning(
+                "Túl kevés OOF sor (%d) a meta-learner tanításához — "
+                "növeld az adatot vagy csökkentsd n_folds-t.", n_filled,
+            )
+        oof_X = np.where(np.isnan(oof_matrix), 0.5, oof_matrix)  # teljes mátrix (predict-hez)
+        self._meta_clf = self._fit_meta(oof_X[filled_mask], y_f.values[filled_mask])
 
         # ── 4. Base learnerek újratanítása teljes adaton ──────────────
         self._base_models = []
@@ -489,7 +501,8 @@ class MetaLabelModel:
             (oof_probs, mean_accuracy, fold_accuracies)
         """
         n = len(X)
-        oof = np.full(n, 0.5)
+        # NaN jelzi: ez a sor nem kapott OOF predikciót (pl. első fold)
+        oof = np.full(n, np.nan)
         fold_accs: List[float] = []
 
         for tr_idx, te_idx in splits:
