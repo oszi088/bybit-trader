@@ -128,6 +128,7 @@ class OverrideDecision:
     refused_rules: List[BlockReason]   = field(default_factory=list)  # nem engedte
     position_size_mult: float = 1.0   # alap ciklus szorzóhoz képest
     note: str = ""
+    justification: str = ""          # részletes emberi olvasható indoklás
 
     def __str__(self) -> str:
         if not self.triggered:
@@ -220,6 +221,9 @@ class OverrideEngine:
                 conviction=conviction,
                 overridden_rules=[],
                 refused_rules=refused + overridden,
+                justification=self._refused_justification(
+                    conviction, refused, blocked_reasons
+                ),
             )
 
         # Minden blokk override-olható → felülírjuk
@@ -241,6 +245,10 @@ class OverrideEngine:
             refused_rules=[],
             position_size_mult=size_mult,
             note=note,
+            justification=self._triggered_justification(
+                intended_action, conviction, overridden, size_mult,
+                signals, fg_value, funding_rate,
+            ),
         )
 
     # ------------------------------------------------------------------ #
@@ -337,6 +345,129 @@ class OverrideEngine:
                 "vol":    volume_anomaly * W["vol"],
             }.items()},
         )
+
+    # ------------------------------------------------------------------ #
+    # Indoklás generálás
+    # ------------------------------------------------------------------ #
+
+    _RULE_NAMES: dict = {
+        BlockReason.TIMING_HARD:       "Timing hard block (hétvége / funding ablak)",
+        BlockReason.TIMING_THRESHOLD:  "Timing score küszöb",
+        BlockReason.CYCLE_DIRECTION:   "Ciklus irány-tilalom",
+        BlockReason.CYCLE_THRESHOLD:   "Ciklus score küszöb",
+        BlockReason.ML_PROBABILITY:    "ML konfidencia küszöb",
+        BlockReason.ALTSEASON_FALSE:   "Hamis altseason blokk",
+        BlockReason.ALTSEASON_TIER:    "Altseason tier zár",
+        BlockReason.ALTSEASON_HALVING: "Halving-túlélő szűrő",
+    }
+
+    @staticmethod
+    def _triggered_justification(
+        direction: str,
+        conviction: ConvictionScore,
+        overridden: List[BlockReason],
+        size_mult: float,
+        signals: Dict[str, int],
+        fg_value: int,
+        funding_rate: float,
+    ) -> str:
+        """Részletes indoklás sikeres override esetén (log + Telegram)."""
+        sign = 1 if direction == "BUY" else -1
+        arrow = "⬆️ VÁSÁRLÁS" if direction == "BUY" else "⬇️ ELADÁS"
+        lines = [f"⚠️  OVERRIDE — {arrow} szabály-felülírással"]
+        lines.append("")
+
+        lines.append("Felülírt szabályok:")
+        for r in overridden:
+            thresh = _OVERRIDE_THRESHOLDS.get(r, 1.0)
+            name = OverrideEngine._RULE_NAMES.get(r, r.value)
+            lines.append(f"  • {name}  (küszöb: {thresh:.2f} ✓ elért: {conviction.total:.3f})")
+
+        lines.append("")
+        lines.append(f"Meggyőzési pontszám: {conviction.total:.3f} / 1.000")
+        lines.append("")
+        lines.append("Bizonyítékok részletesen:")
+
+        # Jelzések
+        n_total = len(signals)
+        n_agree = sum(1 for v in signals.values() if v * sign > 0) if signals else 0
+        bullish_names = [k for k, v in signals.items() if v * sign > 0]
+        lines.append(
+            f"  • Jelzések: {n_agree}/{n_total} egybehangzó"
+            f"  ({conviction.signal_unanimity*100:.0f}%)"
+            f"  [{', '.join(bullish_names[:5])}{'…' if len(bullish_names)>5 else ''}]"
+            f"  → súlyozott hozzájárulás: {conviction.components.get('signal', 0):.3f}"
+        )
+
+        # ML
+        if conviction.ml_confidence != 0.50:   # 0.50 = nincs modell (fallback)
+            ml_label = (
+                "erős" if conviction.ml_confidence > 0.72
+                else "mérsékelt" if conviction.ml_confidence > 0.60
+                else "gyenge"
+            )
+            lines.append(
+                f"  • ML modell: p = {conviction.ml_confidence:.3f}  ({ml_label})"
+                f"  → {conviction.components.get('ml', 0):.3f}"
+            )
+        else:
+            lines.append("  • ML modell: nincs betanított modell (neutral 0.50)")
+
+        # F&G
+        if conviction.fg_extreme > 0:
+            fg_label = "Extreme Fear" if fg_value <= 20 else "Fear"
+            lines.append(
+                f"  • Fear & Greed: {fg_value}  ({fg_label})"
+                f"  → kontrarian {direction} jel"
+                f"  → {conviction.components.get('fg', 0):.3f}"
+            )
+
+        # Funding
+        if conviction.funding_contrarian > 0.2:
+            fr_pct = funding_rate * 100
+            squeeze = "short squeeze setup" if direction == "BUY" else "long squeeze setup"
+            lines.append(
+                f"  • Funding rate: {fr_pct:+.3f}%/8h  ({squeeze})"
+                f"  → {conviction.components.get('funding', 0):.3f}"
+            )
+
+        # Volumen
+        if conviction.volume_anomaly > 0.5:
+            lines.append(
+                f"  • Volumen anomália: {conviction.volume_anomaly:.2f}  (szokatlanul magas)"
+                f"  → fontos piaci esemény"
+                f"  → {conviction.components.get('vol', 0):.3f}"
+            )
+
+        lines.append("")
+        lines.append(
+            f"Pozícióméret: normál ×{size_mult:.2f} ({size_mult*100:.0f}%)"
+            f"  — csökkentett az override kockázata miatt"
+        )
+        lines.append("Stop loss: kötelező, nem override-olható.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _refused_justification(
+        conviction: ConvictionScore,
+        refused: List[BlockReason],
+        all_blocked: List[BlockReason],
+    ) -> str:
+        """Indoklás ha az override NEM triggerelt — miért maradt HOLD."""
+        lines = [
+            f"Override elutasítva  (conviction = {conviction.total:.3f})"
+        ]
+        lines.append("A következő szabályokhoz nem volt elegendő bizonyíték:")
+        for r in refused:
+            thresh = _OVERRIDE_THRESHOLDS.get(r, 1.0)
+            gap = thresh - conviction.total
+            name = OverrideEngine._RULE_NAMES.get(r, r.value)
+            lines.append(
+                f"  • {name}: kell {thresh:.2f},"
+                f" van {conviction.total:.3f}  (hiány: {gap:.3f})"
+            )
+        lines.append("→ Döntés: HOLD marad.")
+        return "\n".join(lines)
 
     @staticmethod
     def _zero_conviction() -> ConvictionScore:
