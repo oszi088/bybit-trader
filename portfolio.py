@@ -23,8 +23,11 @@ from brokers import BybitBroker, PaperBroker
 from config import TradingConfig
 from data_source import CcxtDataSource
 from db import TradeDb
+from drift_detector import DriftDetector, DriftConfig
 from fear_greed import FearGreedSource
 from notify import Notifier
+from performance_attribution import PerformanceAttributor
+from portfolio_risk import PortfolioRiskManager, PortfolioRiskConfig
 from risk_manager import RiskManager
 from trader import Trader
 
@@ -64,6 +67,21 @@ class PortfolioTrader:
             self._shared_broker = BybitBroker(base_config, dry_run=base_config.risk.dry_run)
         else:
             self._shared_broker = None
+
+        # --- Portfolio-szintu kockazat es teljesitmeny modulok ---
+        self._portfolio_risk = PortfolioRiskManager(PortfolioRiskConfig())
+        self._drift = (
+            DriftDetector(DriftConfig(
+                window            = base_config.spot_drift.window,
+                min_trades        = base_config.spot_drift.min_trades,
+                min_sharpe        = base_config.spot_drift.min_sharpe,
+                min_win_rate      = base_config.spot_drift.min_win_rate,
+                min_profit_factor = base_config.spot_drift.min_profit_factor,
+                min_edge_ratio    = base_config.spot_drift.min_edge_ratio,
+            ))
+            if base_config.spot_drift.enabled else None
+        )
+        self._attributor = PerformanceAttributor()
 
         # Symbolonkent egy-egy Trader
         self.traders: List[Trader] = []
@@ -105,19 +123,44 @@ class PortfolioTrader:
 
     def step_all(self) -> None:
         """Egy korben mindegyik symbolra elvegez egy step-et."""
+        # Nyitott poziciok listaja portfolio kockazat ellenorzeshez
+        open_symbols = [t.config.symbol for t in self.traders if t.broker.in_position]
+
         for t in self.traders:
             # Ha a portfolio mar tele van, ne nyithasson uj poziciot;
             # de a meglevoket le tudja zarni (SL/TP/SELL signal)
             if (not t.broker.in_position
                     and self.open_positions >= self.max_open_positions):
-                # 'Lite' lepes: csak SL/TP ellenorzes, uj entry blokkolva
                 continue
+
+            # Portfolio-szintu kockazat ellenorzes uj belep?snel
+            if not t.broker.in_position and self._portfolio_risk:
+                risk_result = self._portfolio_risk.check_new_position(
+                    symbol           = t.config.symbol,
+                    open_symbols     = open_symbols,
+                    returns_dict     = {},   # TODO: visszatekinto hozamok betoltese
+                    total_portfolio_usd = self.base_config.initial_balance,
+                    new_position_usd    = self.base_config.risk.max_order_value_usd,
+                )
+                if not risk_result.can_open:
+                    logger.info("[%s] Portfolio kockazat blokk: %s",
+                                t.config.symbol, risk_result.reason)
+                    continue
+
             try:
                 t.step()
             except Exception as e:
                 logger.exception("[%s] step hiba: %s", t.config.symbol, e)
                 if self.base_config.notify.notify_on_error:
                     self.notifier.error(f"{t.config.symbol}: {e}")
+
+    def performance_report(self) -> str:
+        """Teljesitmeny attribus report generalasa a trade logbol."""
+        trades = self.db.list_trades(limit=500)
+        if not trades:
+            return "Nincs elegendo trade adat a riporthoz."
+        report = self._attributor.generate_report(trades)
+        return self._attributor.format_report(report)
 
     def run_forever(self) -> None:
         logger.info("Portfolio elindult: %d symbol, max %d nyitott",

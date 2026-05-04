@@ -162,6 +162,13 @@ class RiskConfig:
     # Ha True, a broker NEM kuld valodi megbizast (csak logol)
     dry_run: bool = False
 
+    # --- Egymast koveto veszteseg circuit breaker ---
+    # N veszteseg utan: meret felezese / szunet / leallas
+    consecutive_loss_half_at: int = 3    # 3 veszteseg -> 50% meret
+    consecutive_loss_pause_at: int = 5   # 5 veszteseg -> X oras szunet
+    consecutive_loss_pause_hours: float = 4.0
+    consecutive_loss_stop_at: int = 7    # 7 veszteseg -> teljes STOP
+
 
 @dataclass
 class StopConfig:
@@ -268,6 +275,70 @@ class WatchdogConfig:
 
 
 # ============================================================================
+# Spot-only bővítmény konfigurációk
+# ============================================================================
+
+@dataclass
+class SpotExitConfig:
+    """
+    Professzionalis exit stratégia spot tradinghez (exit_manager.py).
+
+    TP1 (reszleges zarás) + trailing stop + profit lock + idobazisu exit.
+    Az atr_tp_mult a CycleRegimeParams-ból felülíródik, ha adaptív ciklus aktív.
+    """
+    enabled: bool = True
+    partial_tp_fraction: float = 0.50   # TP1-nel eladott hanyad (50%)
+    tp1_atr_mult: float = 1.0           # TP1 szint: entry + 1×ATR
+    trailing_atr_mult: float = 1.5     # trailing stop: legmagasabb ar - 1.5×ATR
+    profit_lock_atr_mult: float = 0.5  # profit lock: legmagasabb ar - 0.5×ATR
+    time_exit_bars: int = 0            # 0 = CycleRegimeParams.max_holding_bars-ból
+    breakeven_after_partial: bool = True  # TP1 utan stop = entry (breakevenre huz)
+
+
+@dataclass
+class SpotLiquidityConfig:
+    """Likviditasi szuro spot tradinghez (liquidity_filter.py)."""
+    enabled: bool = True
+    min_volume_usd: float = 500_000.0       # minimum napi forgalom USD-ban
+    max_volume_impact_pct: float = 0.01     # max pozicio: 1% a napi forgalombol
+    max_spread_pct: float = 0.002           # max bid/ask spread 0.2%
+
+
+@dataclass
+class SpotCostConfig:
+    """Kereskedesi koltseg modell spot tradinghez (cost_model.py)."""
+    enabled: bool = True
+    fee_rate: float = 0.001                 # Bybit spot taker dij (0.10%)
+    slippage_small_usd: float = 1_000.0    # ezalatt kis slippage becsles
+    slippage_base_pct: float = 0.0003      # alap slippage (0.03%)
+    slippage_impact_pct: float = 0.005     # piaci impact szorzo
+    min_return_multiplier: float = 1.5     # vart hozam >= koltseg x 1.5
+
+
+@dataclass
+class SpotTWAPConfig:
+    """TWAP vegrehajtasi konfig spot tradinghez (twap.py)."""
+    enabled: bool = False                  # nagy pozicional kapcsold be
+    num_slices: int = 6
+    total_duration_sec: int = 1800         # 30 perc
+    max_price_drift_pct: float = 0.015    # 1.5% felet abort
+    min_order_size_usd: float = 500.0
+    use_twap_above_usd: float = 2000.0    # ennyi felett auto-TWAP
+
+
+@dataclass
+class SpotDriftConfig:
+    """Modell drift detektalas (drift_detector.py)."""
+    enabled: bool = True
+    window: int = 20                  # utolso N trade ablaka
+    min_trades: int = 10             # ennyi alatt nem detektalunk
+    min_sharpe: float = 0.30
+    min_win_rate: float = 0.40
+    min_profit_factor: float = 1.0
+    min_edge_ratio: float = 0.80
+
+
+# ============================================================================
 # Fokonfiguracio
 # ============================================================================
 
@@ -308,6 +379,13 @@ class TradingConfig:
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     fear_greed: FearGreedConfig = field(default_factory=FearGreedConfig)
     mtf: MTFConfig = field(default_factory=MTFConfig)
+
+    # --- Spot-only profi bővítmények ---
+    spot_exit: SpotExitConfig = field(default_factory=SpotExitConfig)
+    spot_liquidity: SpotLiquidityConfig = field(default_factory=SpotLiquidityConfig)
+    spot_cost: SpotCostConfig = field(default_factory=SpotCostConfig)
+    spot_twap: SpotTWAPConfig = field(default_factory=SpotTWAPConfig)
+    spot_drift: SpotDriftConfig = field(default_factory=SpotDriftConfig)
 
     @property
     def bybit_host(self) -> str:

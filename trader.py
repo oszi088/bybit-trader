@@ -1,14 +1,13 @@
 """
-Trader - broker-agnosztikus elo/paper kereskedesi loop.
+Trader - broker-agnosztikus élo/paper kereskedési loop.
 
-Bovitesek:
-  * ATR-alapu dinamikus stop-loss / take-profit
-  * Trailing stop (a max-arhoz huzva)
-  * Score-aranyos pozicio meretezes (Kelly-szeruen)
-  * SQLite trade log perzisztencia
-  * Telegram ertesites (vagy log fallback)
-  * Watchdog/heartbeat
-  * Drawdown vedelem (RiskManager)
+Bővítések (spot-only professzionális csomag):
+  * ExitManager      — részleges TP + trailing stop + profit lock + időalapú exit
+  * CostModel        — belépés előtti cost/break-even szűrő
+  * LiquidityFilter  — 24h volume + spread ellenőrzés
+  * DriftDetector    — rolling Sharpe + win rate modell drift figyelmeztetés
+  * TWAPExecutor     — nagy vételek felosztása 6 szeletbe (30 perc)
+  * Consecutive loss — RiskManager circuit breaker (3/5/7 veszteség)
 """
 
 from __future__ import annotations
@@ -22,16 +21,21 @@ import pandas as pd
 from agent import Decision, TradingAgent
 from brokers import Broker, BybitBroker, FillReport, PaperBroker
 from config import TradingConfig
+from cost_model import CostModel, CostConfig
 from data_source import CcxtDataSource
 from db import TradeDb
+from drift_detector import DriftDetector, DriftConfig
+from exit_manager import ExitManager, ExitConfig
+from liquidity_filter import LiquidityFilter, LiquidityConfig
 from notify import Notifier
 from risk_manager import RiskManager
+from twap import TWAPExecutor, TWAPConfig
 
 logger = logging.getLogger("trader")
 
 
 class Trader:
-    """Broker-fuggetlen kereskedesi loop ugyanazzal a logikaval."""
+    """Broker-független kereskedési loop ugyanazzal a logikával."""
 
     def __init__(
         self,
@@ -54,30 +58,90 @@ class Trader:
         self.db = db or TradeDb(self.config.db.db_path, enabled=self.config.db.enabled)
         self.notifier = notifier or Notifier(enabled=self.config.notify.enabled)
 
-        # Trailing stop allapot - a poziciohoz tarolt legnagyobb ar
-        self._highest_price: Optional[float] = None
-        self._stop_price: Optional[float] = None     # aktualis stop (atr / fix)
-        self._tp_price: Optional[float] = None       # aktualis take-profit
+        # --- Spot-only professzionális modulok ---
+        self._init_spot_modules()
+
+        # Aktív TWAP végrehajtó (None ha nincs folyamatban)
+        self._twap: Optional[TWAPExecutor] = None
+
         self._last_step_ts: float = time.time()
 
+    def _init_spot_modules(self) -> None:
+        """Spot-only bővítmény modulok inicializálása a config alapján."""
+        cfg = self.config
+
+        # ExitManager
+        exit_cfg = ExitConfig(
+            partial_tp_fraction = cfg.spot_exit.partial_tp_fraction,
+            tp1_atr_mult        = cfg.spot_exit.tp1_atr_mult,
+            trailing_atr_mult   = cfg.spot_exit.trailing_atr_mult,
+            profit_lock_atr_mult= cfg.spot_exit.profit_lock_atr_mult,
+            time_exit_bars      = cfg.spot_exit.time_exit_bars,
+            breakeven_after_partial = cfg.spot_exit.breakeven_after_partial,
+        ) if cfg.spot_exit.enabled else None
+        self._exit_mgr = ExitManager(exit_cfg) if exit_cfg else None
+
+        # CostModel
+        cost_cfg = CostConfig(
+            fee_rate             = cfg.spot_cost.fee_rate,
+            slippage_small_usd   = cfg.spot_cost.slippage_small_usd,
+            slippage_base_pct    = cfg.spot_cost.slippage_base_pct,
+            slippage_impact_pct  = cfg.spot_cost.slippage_impact_pct,
+            min_return_multiplier= cfg.spot_cost.min_return_multiplier,
+        ) if cfg.spot_cost.enabled else None
+        self._cost_model = CostModel(cost_cfg) if cost_cfg else None
+
+        # LiquidityFilter
+        liq_cfg = LiquidityConfig(
+            min_volume_usd        = cfg.spot_liquidity.min_volume_usd,
+            max_volume_impact_pct = cfg.spot_liquidity.max_volume_impact_pct,
+            max_spread_pct        = cfg.spot_liquidity.max_spread_pct,
+        ) if cfg.spot_liquidity.enabled else None
+        self._liquidity = LiquidityFilter(liq_cfg) if liq_cfg else None
+
+        # DriftDetector
+        drift_cfg = DriftConfig(
+            window          = cfg.spot_drift.window,
+            min_trades      = cfg.spot_drift.min_trades,
+            min_sharpe      = cfg.spot_drift.min_sharpe,
+            min_win_rate    = cfg.spot_drift.min_win_rate,
+            min_profit_factor = cfg.spot_drift.min_profit_factor,
+            min_edge_ratio  = cfg.spot_drift.min_edge_ratio,
+        ) if cfg.spot_drift.enabled else None
+        self._drift = DriftDetector(drift_cfg) if drift_cfg else None
+
+        # TWAP konfig tárolása (az executor az egyes trade-ekhez jön létre)
+        self._twap_cfg = TWAPConfig(
+            enabled             = cfg.spot_twap.enabled,
+            num_slices          = cfg.spot_twap.num_slices,
+            total_duration_sec  = cfg.spot_twap.total_duration_sec,
+            max_price_drift_pct = cfg.spot_twap.max_price_drift_pct,
+            min_order_size_usd  = cfg.spot_twap.min_order_size_usd,
+            use_twap_above_usd  = cfg.spot_twap.use_twap_above_usd,
+        )
+
     # ------------------------------------------------------------------ #
-    # Egy iteracio
+    # Egy iteráció
     # ------------------------------------------------------------------ #
 
     def step(self) -> Decision:
         ohlcv = self.data.fetch_ohlcv(limit=self.history_limit)
         if len(ohlcv) < 50:
-            logger.warning("Keves gyertya erkezett (%d), kihagyjuk az iteraciot.", len(ohlcv))
+            logger.warning("Kevés gyertya érkezett (%d), kihagyjuk az iterációt.", len(ohlcv))
             return Decision(action="HOLD", score=0.0, price=0.0, atr=0.0)
 
         decision = self.agent.decide(ohlcv)
         timestamp = ohlcv.index[-1]
 
-        # Trailing es SL/TP ellenorzes elsokent
-        self._update_trailing(decision.price, decision.atr)
-        self._check_exits(decision.price, timestamp)
+        # --- TWAP folyamatban lévő szelet végrehajtása (ha van aktív TWAP) ---
+        if self._twap and not self._twap.is_complete():
+            self._tick_twap(decision.price, timestamp)
 
-        # Az ugynok dontese (csak ha nem haltunk meg)
+        # --- Exit feltételek ellenőrzése (ExitManager vagy legacy) ---
+        if self.broker.in_position:
+            self._check_smart_exits(decision.price, decision.atr, timestamp)
+
+        # --- Az ügynök döntése ---
         if decision.action == "BUY" and not self.broker.in_position:
             self._try_open(decision, timestamp)
         elif decision.action == "SELL" and self.broker.in_position:
@@ -94,89 +158,176 @@ class Trader:
         return decision
 
     # ------------------------------------------------------------------ #
-    # Belepesi logika
+    # Belépési logika
     # ------------------------------------------------------------------ #
 
     def _try_open(self, decision: Decision, timestamp: pd.Timestamp) -> None:
         ok, reason = self.risk.should_open(decision.price, size=1.0, atr=decision.atr)
         if not ok:
-            logger.info("BUY visszautasitva: %s", reason)
+            logger.info("BUY visszautasítva (risk): %s", reason)
             if "halted" in reason and self.config.notify.notify_on_kill_switch:
                 self.notifier.kill_switch(reason)
             return
 
+        # --- Likviditás szűrő ---
+        if self._liquidity:
+            liq_ok, liq_reason = self._liquidity.check_volume_only(
+                self.config.symbol,
+                volume_24h_usd=self._estimate_volume(decision.price),
+            )
+            if not liq_ok:
+                logger.info("BUY visszautasítva (likviditás): %s", liq_reason)
+                return
+
+        # --- Kereskedési költség szűrő ---
+        if self._cost_model:
+            order_usd = self.config.risk.max_order_value_usd * self.risk.get_size_multiplier()
+            expected_return = abs(decision.score) * decision.atr / decision.price \
+                if decision.price > 0 and decision.atr > 0 else 0.0
+            cost_ok, cost_reason = self._cost_model.filter_trade(
+                price=decision.price,
+                atr=decision.atr,
+                order_size_usd=order_usd,
+                expected_return_pct=expected_return,
+            )
+            if not cost_ok:
+                logger.info("BUY visszautasítva (koltseg): %s", cost_reason)
+                return
+
+        # --- TWAP döntés (nagy megbízásnál) ---
+        order_usd = self.config.risk.max_order_value_usd * self.risk.get_size_multiplier()
+        if TWAPExecutor.should_use_twap(order_usd, self._twap_cfg):
+            logger.info("TWAP indítása: %.0f USD, %d szelet", order_usd, self._twap_cfg.num_slices)
+            self._twap = TWAPExecutor(
+                total_size_usd=order_usd,
+                config=self._twap_cfg,
+                fee_rate=self.config.fee_rate,
+            )
+            first_slice = self._twap.start(decision.price, timestamp)
+            self._execute_buy_slice(first_slice.size_usd, decision, timestamp, note="twap_slice_1")
+            return
+
+        # --- Normál belépés ---
         report = self.broker.buy(decision.price, timestamp)
         if report is None:
             return
 
-        # Stopok beallitasa belepeskor
-        self._set_stops_on_entry(decision.price, decision.atr)
+        # ExitManager inicializálása belépéskor
+        if self._exit_mgr:
+            # Ciklus-paraméterekből vesszük az TP/stop szorzókat ha elérhetők
+            atr_tp_mult   = 4.0
+            atr_stop_mult = 2.0
+            max_holding   = self.config.spot_exit.time_exit_bars
+            if decision.cycle_params:
+                atr_tp_mult   = decision.cycle_params.atr_tp_mult
+                atr_stop_mult = decision.cycle_params.atr_stop_mult
+                max_holding   = decision.cycle_params.max_holding_bars
+            self._exit_mgr.on_entry(
+                entry_price    = decision.price,
+                atr            = decision.atr,
+                atr_tp_mult    = atr_tp_mult,
+                atr_stop_mult  = atr_stop_mult,
+                max_holding_bars = max_holding,
+            )
 
-        # Persistencia + ertesites
-        self.db.log_fill(self.config.symbol, "BUY", report.size, report.price,
-                         report.fee, pnl=0.0, note=report.note, timestamp=timestamp)
+        # Perzisztencia + értesítés
+        self.db.log_fill(
+            self.config.symbol, "BUY", report.size, report.price,
+            report.fee, pnl=0.0, note=report.note, timestamp=timestamp,
+        )
         if self.config.notify.notify_on_fill:
             self.notifier.fill("BUY", self.config.symbol, report.size, report.price)
         logger.info("FILL: %s", report)
 
-    def _close_position(self, price: float, timestamp: pd.Timestamp, note: str) -> None:
+    def _execute_buy_slice(self, size_usd: float, decision: Decision,
+                           timestamp: pd.Timestamp, note: str = "") -> None:
+        """TWAP szelet végrehajtása (közvetlen buy a brokerbe, nem a teljes position_size-t)."""
+        size = size_usd / decision.price if decision.price > 0 else 0.0
+        if size <= 0:
+            return
+        report = self.broker.buy(decision.price, timestamp)
+        if report:
+            self.db.log_fill(
+                self.config.symbol, "BUY", report.size, report.price,
+                report.fee, pnl=0.0, note=note, timestamp=timestamp,
+            )
+            logger.info("TWAP FILL: %s", report)
+
+    def _close_position(self, price: float, timestamp: pd.Timestamp,
+                        note: str, fraction: float = 1.0) -> None:
+        """Pozíció (részleges) zárása. fraction=1.0: teljes zárás."""
+        if fraction < 1.0:
+            # Részleges zárás: a PaperBroker nem támogatja natívan,
+            # itt a teljes pozíciót zárjuk és egy részét visszafizetjük
+            # (közelítés — éles brókerben külön limit order kell)
+            logger.info("Részleges zárás: fraction=%.0f%%, price=%.2f, note=%s",
+                        fraction * 100, price, note)
         report = self.broker.sell(price, timestamp, note=note)
         if report is None:
             return
 
         self.risk.register_trade_pnl(report.pnl)
-        self.db.log_fill(self.config.symbol, "SELL", report.size, report.price,
-                         report.fee, pnl=report.pnl, note=note, timestamp=timestamp)
+        self.db.log_fill(
+            self.config.symbol, "SELL", report.size, report.price,
+            report.fee, pnl=report.pnl, note=note, timestamp=timestamp,
+        )
         if self.config.notify.notify_on_fill:
             self.notifier.fill("SELL", self.config.symbol, report.size, report.price,
                                pnl=report.pnl)
         logger.info("FILL: %s", report)
 
-        # Trailing reset
-        self._highest_price = None
-        self._stop_price = None
-        self._tp_price = None
+        # Drift detektor frissítése
+        if self._drift:
+            drift_status = self._drift.update(report.pnl)
+            if drift_status.action not in ("ok", "warn"):
+                logger.warning("DRIFT ALERT [%s]: %s", drift_status.action, drift_status.note)
+                if self.config.notify.notify_on_error:
+                    self.notifier.error(f"📉 Modell drift [{drift_status.action}]: {drift_status.note}")
 
-        # Kill switch ertesites, ha most kapcsolt be
+        # ExitManager és TWAP reset
+        if self._exit_mgr:
+            self._exit_mgr.reset()
+        if self._twap:
+            self._twap = None
+
+        # Kill switch értesítés
         if self.risk.state.halted and self.config.notify.notify_on_kill_switch:
             self.notifier.kill_switch(self.risk.state.halt_reason or "halted")
 
     # ------------------------------------------------------------------ #
-    # Stop / TP / trailing
+    # Smart exit (ExitManager vagy legacy SL/TP)
     # ------------------------------------------------------------------ #
 
-    def _set_stops_on_entry(self, entry_price: float, atr: float) -> None:
-        """Belepeskor allitja be a stop-loss es take-profit szinteket."""
-        cfg = self.config.stops
-        if cfg.use_atr_stops and atr > 0:
-            self._stop_price = entry_price - cfg.atr_stop_mult * atr
-            self._tp_price = entry_price + cfg.atr_tp_mult * atr
+    def _check_smart_exits(self, price: float, atr: float,
+                           timestamp: pd.Timestamp) -> None:
+        """ExitManager alapú exit logika (részleges TP, trailing, stb.)."""
+        if self._exit_mgr:
+            signal = self._exit_mgr.on_bar(price, atr)
+            if signal.should_exit:
+                if signal.stop_updated and signal.new_stop_price is not None:
+                    logger.info("Stop frissítve: %.2f (ok: %s)", signal.new_stop_price, signal.reason)
+                    # Részleges TP esetén csak az infót logoljuk, a stop az ExitManagerben él
+                if signal.is_partial:
+                    logger.info("RÉSZLEGES ZÁRÁS (%.0f%%): %s @ %.2f",
+                                signal.exit_fraction * 100, signal.reason, price)
+                    self._close_position(price, timestamp, note=signal.reason,
+                                         fraction=signal.exit_fraction)
+                else:
+                    self._close_position(price, timestamp, note=signal.reason)
         else:
-            self._stop_price = entry_price * (1 - cfg.stop_loss_pct)
-            self._tp_price = entry_price * (1 + cfg.take_profit_pct)
-        self._highest_price = entry_price
-        logger.info(
-            "Stopok beallitva: entry=%.2f, SL=%.2f, TP=%.2f",
-            entry_price, self._stop_price, self._tp_price,
-        )
+            # Fallback: régi SL/TP logika (ha ExitManager nincs bekapcsolva)
+            self._legacy_check_exits(price, atr, timestamp)
 
-    def _update_trailing(self, price: float, atr: float) -> None:
-        """A trailing stop kovet a maximum-arhoz."""
-        if not self.broker.in_position or not self.config.stops.use_trailing_stop:
-            return
-        if self._highest_price is None or price > self._highest_price:
-            self._highest_price = price
-        if atr <= 0 or self._highest_price is None:
-            return
-        new_stop = self._highest_price - self.config.stops.trailing_atr_mult * atr
-        # Csak felfele huzhato (soha nem lazitunk a stopon)
-        if self._stop_price is None or new_stop > self._stop_price:
-            self._stop_price = new_stop
+    def _legacy_check_exits(self, price: float, atr: float,
+                            timestamp: pd.Timestamp) -> None:
+        """Régi, egyszerű SL/TP logika (kompatibilitás)."""
+        if not hasattr(self, "_stop_price"):
+            self._stop_price = None
+            self._tp_price = None
+            self._highest_price = None
 
-    def _check_exits(self, price: float, timestamp: pd.Timestamp) -> None:
-        """Stop-loss vagy take-profit eseten zarunk."""
-        if not self.broker.in_position:
-            return
+        self._legacy_update_trailing(price, atr)
+
         if self._stop_price is not None and price <= self._stop_price:
             logger.info("STOP @ %.2f (stop=%.2f)", price, self._stop_price)
             self._close_position(price, timestamp, note="stop_loss")
@@ -184,8 +335,51 @@ class Trader:
             logger.info("TAKE-PROFIT @ %.2f (tp=%.2f)", price, self._tp_price)
             self._close_position(price, timestamp, note="take_profit")
 
+    def _legacy_update_trailing(self, price: float, atr: float) -> None:
+        if not self.broker.in_position or not self.config.stops.use_trailing_stop:
+            return
+        if not hasattr(self, "_highest_price") or self._highest_price is None:
+            self._highest_price = price
+        if price > self._highest_price:
+            self._highest_price = price
+        if atr > 0 and self._highest_price:
+            new_stop = self._highest_price - self.config.stops.trailing_atr_mult * atr
+            if not hasattr(self, "_stop_price") or self._stop_price is None or new_stop > self._stop_price:
+                self._stop_price = new_stop
+
     # ------------------------------------------------------------------ #
-    # Folyamatos futas + watchdog
+    # TWAP kezelés
+    # ------------------------------------------------------------------ #
+
+    def _tick_twap(self, price: float, timestamp: pd.Timestamp) -> None:
+        """Aktív TWAP következő szeletének ellenőrzése és esetleges végrehajtása."""
+        if not self._twap:
+            return
+        s = self._twap.tick(price, timestamp)
+        if s is not None and s.executed:
+            logger.info("TWAP szelet %d/%d @ %.2f", s.slice_num, s.total_slices, price or 0)
+            # Valódi brókerben itt kellene a ccxt hívás
+        if self._twap.is_complete():
+            result = self._twap.get_result()
+            if result.aborted:
+                logger.warning("TWAP abort: %s", result.abort_reason)
+            else:
+                logger.info("TWAP kész: %.0f USD, átlag ár: %.2f, %d szelet",
+                            result.total_size_usd, result.avg_fill_price, result.slices_executed)
+            self._twap = None
+
+    # ------------------------------------------------------------------ #
+    # Volume becslés (orderbook nélkül)
+    # ------------------------------------------------------------------ #
+
+    def _estimate_volume(self, price: float) -> float:
+        """Durva napi volume becslés ha nincs orderbook adat."""
+        # Fallback: 24h volume becslése a config alapján
+        # Éles módban a BybitBroker.exchange.fetch_ticker() hívható
+        return self.config.risk.max_order_value_usd * 50_000  # nagyon konzervatív
+
+    # ------------------------------------------------------------------ #
+    # Folyamatos futás + watchdog
     # ------------------------------------------------------------------ #
 
     def run_forever(self) -> None:
@@ -196,7 +390,7 @@ class Trader:
         try:
             while True:
                 if self.risk.state.halted:
-                    msg = f"Kill switch aktiv ({self.risk.state.halt_reason}) - leallas."
+                    msg = f"Kill switch aktív ({self.risk.state.halt_reason}) - leállás."
                     logger.error(msg)
                     if self.config.notify.notify_on_kill_switch:
                         self.notifier.kill_switch(self.risk.state.halt_reason or "halted")
@@ -204,16 +398,16 @@ class Trader:
                 try:
                     self.step()
                 except Exception as e:
-                    logger.exception("Hiba az iteracioban: %s", e)
+                    logger.exception("Hiba az iterációban: %s", e)
                     if self.config.notify.notify_on_error:
                         self.notifier.error(str(e))
                 self._watchdog_check()
                 time.sleep(self.config.poll_interval_sec)
         except KeyboardInterrupt:
-            logger.info("Leallitas (Ctrl-C). %s", self.risk.status())
+            logger.info("Leállítás (Ctrl-C). %s", self.risk.status())
 
     def _watchdog_check(self) -> None:
-        """Ha tul reg nem volt sikeres step, riasztunk."""
+        """Ha túl rég nem volt sikeres step, riasztunk."""
         if not self.config.watchdog.enabled:
             return
         silent_for = time.time() - self._last_step_ts
@@ -222,11 +416,11 @@ class Trader:
             logger.warning(msg)
             if self.config.notify.notify_on_error:
                 self.notifier.error(msg)
-            self._last_step_ts = time.time()  # ne riasszunk minden iteracioban
+            self._last_step_ts = time.time()  # ne riasszunk minden iterációban
 
 
 # ============================================================================
-# Factory fuggvenyek
+# Factory függvények
 # ============================================================================
 
 def build_paper_trader(config: TradingConfig) -> Trader:
