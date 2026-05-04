@@ -118,14 +118,33 @@ def fetch_full_history(
 
     all_rows: List[list] = []
     cursor = since_ms
+    _MAX_RETRIES = 4          # maximalis ujraprobalkozasok szama
+    _RETRY_SLEEP = 5          # alap varakozas masodpercben (exponencialis)
+
     while cursor < end_ms:
-        try:
-            rows = exchange.fetch_ohlcv(symbol, timeframe, since=cursor, limit=batch_limit)
-        except Exception as e:
-            logger.warning("Hiba %s @ %s: %s - varakozas 5s, ujraprobalkozas",
-                           symbol, datetime.fromtimestamp(cursor/1000, tz=timezone.utc), e)
-            time.sleep(5)
-            continue
+        retries = 0
+        while retries < _MAX_RETRIES:
+            try:
+                rows = exchange.fetch_ohlcv(symbol, timeframe, since=cursor, limit=batch_limit)
+                break   # sikeres lekerdes: kilepes a retry-loopbol
+            except Exception as e:
+                retries += 1
+                wait = _RETRY_SLEEP * retries   # 5s, 10s, 15s, 20s
+                logger.warning(
+                    "Hiba %s @ %s (kiserlet %d/%d): %s — varakozas %ds",
+                    symbol,
+                    datetime.fromtimestamp(cursor / 1000, tz=timezone.utc),
+                    retries, _MAX_RETRIES, e, wait,
+                )
+                time.sleep(wait)
+        else:
+            # Minden retry kiment — leallas ezzel a symbolnal
+            logger.error(
+                "Max ujraprobalkozas (%d) elerest: %s @ %s. Leallas.",
+                _MAX_RETRIES, symbol,
+                datetime.fromtimestamp(cursor / 1000, tz=timezone.utc),
+            )
+            break
 
         if not rows:
             # nem jott vissza adat ezen az idointervallumon
