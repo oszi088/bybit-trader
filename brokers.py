@@ -64,7 +64,8 @@ class Broker(ABC):
             size: Optional[float] = None) -> Optional[FillReport]: ...
 
     @abstractmethod
-    def sell(self, price: float, timestamp: pd.Timestamp, note: str = "") -> Optional[FillReport]: ...
+    def sell(self, price: float, timestamp: pd.Timestamp,
+             note: str = "", fraction: float = 1.0) -> Optional[FillReport]: ...
 
     @abstractmethod
     def equity(self, mark_price: float) -> float: ...
@@ -108,18 +109,22 @@ class PaperBroker(Broker):
         self.history.append(report)
         return report
 
-    def sell(self, price: float, timestamp: pd.Timestamp, note: str = "") -> Optional[FillReport]:
+    def sell(self, price: float, timestamp: pd.Timestamp,
+             note: str = "", fraction: float = 1.0) -> Optional[FillReport]:
         if not self.in_position:
             return None
-        size = self.coin_balance
+        fraction = max(0.0, min(1.0, fraction))
+        size = self.coin_balance * fraction
         gross = size * price
         fee = gross * self.fee_rate
         proceeds = gross - fee
         entry = self._entry_price or price
         pnl = proceeds - size * entry * (1 + self.fee_rate)
         self.cash += proceeds
-        self.coin_balance = 0.0
-        self._entry_price = None
+        self.coin_balance -= size
+        if self.coin_balance <= 0 or fraction >= 1.0:
+            self.coin_balance = 0.0
+            self._entry_price = None
         report = FillReport("SELL", size, price, fee, timestamp, pnl=pnl, note=note)
         self.history.append(report)
         return report
@@ -300,17 +305,19 @@ class BybitBroker(Broker):
         self.history.append(report)
         return report
 
-    def sell(self, price: float, timestamp: pd.Timestamp, note: str = "") -> Optional[FillReport]:
+    def sell(self, price: float, timestamp: pd.Timestamp,
+             note: str = "", fraction: float = 1.0) -> Optional[FillReport]:
         if not self.in_position:
             return None
 
-        size = self._round_size(self._coin_balance)
+        fraction = max(0.0, min(1.0, fraction))
+        size = self._round_size(self._coin_balance * fraction)
         if size <= 0:
             return None
 
         if self.dry_run:
-            logger.info("[DRY-RUN] SELL %s %.6f @ %.2f (%s)",
-                        self.config.symbol, size, price, note)
+            logger.info("[DRY-RUN] SELL %s %.6f @ %.2f frac=%.0f%% (%s)",
+                        self.config.symbol, size, price, fraction * 100, note)
         else:
             order = self.exchange.create_market_sell_order(self.config.symbol, size)
             order_id = order.get("id")
@@ -321,16 +328,18 @@ class BybitBroker(Broker):
                 logger.error("SELL order %s nem toltodott ki (status=%s) - pozicio nyitva marad",
                              order_id, status)
                 return None
-            logger.info("Bybit SELL order: %s (status=%s)", order_id, status)
+            logger.info("Bybit SELL order: %s (status=%s, frac=%.0f%%)", order_id, status, fraction * 100)
 
         gross = size * price
         fee = gross * self.config.fee_rate
         entry = self._entry_price or price
         pnl = (price - entry) * size - 2 * fee  # közelítés (két oldali díj)
 
-        # Helyi pozíció törlése
-        self._coin_balance = 0.0
-        self._entry_price = None
+        # Helyi pozíció frissítése — részleges zárás esetén a maradék megmarad
+        self._coin_balance -= size
+        if self._coin_balance <= 0 or fraction >= 1.0:
+            self._coin_balance = 0.0
+            self._entry_price = None
         report = FillReport("SELL", size, price, fee, timestamp, pnl=pnl,
                             note=note or ("dry-run" if self.dry_run else ""))
         self.history.append(report)

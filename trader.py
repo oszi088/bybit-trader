@@ -317,7 +317,7 @@ class Trader:
         # FIX #2: ciklus-infó hozzáfűzése a note-hoz (performance attribúcióhoz)
         full_note = f"{note}|cycle:{self._entry_cycle}" if self._entry_cycle else note
 
-        report = self.broker.sell(price, timestamp, note=full_note)
+        report = self.broker.sell(price, timestamp, note=full_note, fraction=fraction)
         if report is None:
             return
 
