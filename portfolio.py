@@ -109,11 +109,14 @@ class PortfolioTrader:
             self.traders.append(t)
 
     def _symbol_config(self, symbol: str) -> TradingConfig:
-        """A base config klonja, a symbol felulirva."""
-        # dataclasses.replace-szel mely-klont csinalunk a kozos almodulokrol is,
-        # de itt a Risk + Notify + DB-t megosztjuk -> egyszeruen masoljuk a refet.
-        from copy import copy
-        cfg = copy(self.base_config)
+        """A base config mély klonja, a symbol felülírva.
+
+        deepcopy nélkül az összes Trader ugyanazt a Risk/Stop/Notify
+        sub-objektumot osztaná meg — az egyik Trader stop-loss
+        állapota kisziváragna a másikba.
+        """
+        from copy import deepcopy
+        cfg = deepcopy(self.base_config)
         cfg.symbol = symbol
         return cfg
 
