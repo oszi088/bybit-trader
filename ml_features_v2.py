@@ -29,7 +29,7 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from config import IndicatorParams
+from config import IndicatorParams, TIMEFRAME_PERIODS_PER_YEAR
 from crypto_data import CryptoDataSnapshot
 from indicators import compute_all
 from orderbook_features import estimate_ob_imbalance_from_ohlcv
@@ -49,6 +49,7 @@ def build_feature_matrix_v2(
     crypto_snap:     Optional[CryptoDataSnapshot] = None,  # élő crypto adat
     macro_history:   Optional[pd.DataFrame]      = None,   # historikus makro (tanításhoz)
     onchain_history: Optional[Dict[str, pd.DataFrame]] = None,  # historikus on-chain
+    timeframe: str = "1h",                                 # az OHLCV timeframe-je (annualizációhoz)
 ) -> pd.DataFrame:
     """
     Teljes feature matrix — 100+ feature.
@@ -201,8 +202,10 @@ def build_feature_matrix_v2(
     # ================================================================== #
 
     # Realized volatility (log-hozamok szórása)
+    # Crypto 24/7 piac: 365 nap × periódusok/nap (nem 252 munkanap × 24)
+    _periods_per_year = float(TIMEFRAME_PERIODS_PER_YEAR.get(timeframe, 365 * 24))
     for w in (5, 10, 20):
-        feats[f"realized_vol_{w}"] = log_ret.rolling(w).std() * np.sqrt(252 * 24)
+        feats[f"realized_vol_{w}"] = log_ret.rolling(w).std() * np.sqrt(_periods_per_year)
 
     # Volatilitás arány: rövid / hosszú (volatilitás rezsim jelzője)
     if "realized_vol_5" in feats.columns and "realized_vol_20" in feats.columns:
