@@ -97,8 +97,9 @@ class OrderBookSnapshot:
         if len(self.bids) < top_levels or len(self.asks) < top_levels:
             return 0
 
-        avg_bid = np.mean([sz for _, sz in self.bids[:top_levels]])
-        avg_ask = np.mean([sz for _, sz in self.asks[:top_levels]])
+        # Exclude index 0 (top_bid/top_ask) from average to avoid self-comparison bias
+        avg_bid = np.mean([sz for _, sz in self.bids[1:top_levels]])
+        avg_ask = np.mean([sz for _, sz in self.asks[1:top_levels]])
 
         top_bid = self.bids[0][1]
         top_ask = self.asks[0][1]
