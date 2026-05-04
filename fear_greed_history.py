@@ -133,8 +133,9 @@ class FearGreedHistory:
 
     @staticmethod
     def _cache_fresh(path: Path) -> bool:
-        import os
-        age_seconds = datetime.now().timestamp() - os.path.getmtime(path)
+        import os, time
+        # time.time() biztosan UTC epoch — nem függ a lokális DST beállítástól
+        age_seconds = time.time() - os.path.getmtime(path)
         return age_seconds < _CACHE_MAX_AGE_HOURS * 3600
 
     @staticmethod
