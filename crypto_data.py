@@ -490,40 +490,41 @@ class CryptoDataSnapshot:
 
 def fetch_all(symbol: str = "BTC",
               news_api_key: Optional[str] = None) -> CryptoDataSnapshot:
-    """Minden forrás párhuzamos lekérdezése — egyfajta 'adat aggregátor'."""
-    import threading
+    """
+    Minden forrás párhuzamos lekérdezése ThreadPoolExecutor-ral.
 
-    snap = CryptoDataSnapshot()
-    errors: list = []
+    A lambda-closure csapdát elkerüljük: minden task neve és
+    függvénye a submit() híváskor rögzül.  A Future.result() hívás
+    elkapja és loggolja a thread-beli kivételeket — nem maradnak
+    csendben.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
 
-    def _run(name, fn):
-        try:
-            return fn()
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-            return None
-
-    results = {}
-    threads = {
-        "macro":   threading.Thread(target=lambda: results.__setitem__("macro",   _run("macro",   fetch_macro))),
-        "onchain": threading.Thread(target=lambda: results.__setitem__("onchain", _run("onchain", fetch_onchain))),
-        "liq":     threading.Thread(target=lambda: results.__setitem__("liq",     _run("liq",     lambda: fetch_liquidations(symbol)))),
-        "options": threading.Thread(target=lambda: results.__setitem__("options", _run("options", lambda: fetch_options(symbol)))),
-        "news":    threading.Thread(target=lambda: results.__setitem__("news",    _run("news",    lambda: fetch_news_sentiment(symbol, news_api_key)))),
+    tasks = {
+        "macro":   fetch_macro,
+        "onchain": fetch_onchain,
+        "liq":     lambda: fetch_liquidations(symbol),
+        "options": lambda: fetch_options(symbol),
+        "news":    lambda: fetch_news_sentiment(symbol, news_api_key),
     }
 
-    for t in threads.values():
-        t.start()
-    for t in threads.values():
-        t.join(timeout=10)
+    snap = CryptoDataSnapshot()
+    results: Dict[str, object] = {}
+
+    with ThreadPoolExecutor(max_workers=len(tasks), thread_name_prefix="crypto_fetch") as pool:
+        future_to_name = {pool.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(future_to_name, timeout=12):
+            name = future_to_name[future]
+            try:
+                results[name] = future.result(timeout=1)
+            except Exception as exc:
+                logger.warning("crypto_data [%s] lekérés sikertelen: %s", name, exc)
+                results[name] = None
 
     snap.macro       = results.get("macro")
     snap.onchain     = results.get("onchain")
     snap.liquidation = results.get("liq")
     snap.options     = results.get("options")
     snap.news        = results.get("news")
-
-    if errors:
-        logger.warning("Részleges hibák: %s", "; ".join(errors))
 
     return snap
