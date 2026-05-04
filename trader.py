@@ -20,7 +20,7 @@ import pandas as pd
 
 from agent import Decision, TradingAgent
 from brokers import Broker, BybitBroker, FillReport, PaperBroker
-from config import TradingConfig
+from config import TradingConfig, TIMEFRAME_PERIODS_PER_YEAR
 from cost_model import CostModel, CostConfig
 from data_source import CcxtDataSource
 from db import TradeDb
@@ -64,6 +64,12 @@ class Trader:
         # Aktív TWAP végrehajtó (None ha nincs folyamatban)
         self._twap: Optional[TWAPExecutor] = None
 
+        # FIX #2: aktív belépés ciklus-neve (SELL note-ba kerül)
+        self._entry_cycle: str = ""
+
+        # FIX #7: utolsó OHLCV %-os hozamok (portfolio kockázathoz)
+        self._last_returns: list[float] = []
+
         self._last_step_ts: float = time.time()
 
     def _init_spot_modules(self) -> None:
@@ -81,9 +87,9 @@ class Trader:
         ) if cfg.spot_exit.enabled else None
         self._exit_mgr = ExitManager(exit_cfg) if exit_cfg else None
 
-        # CostModel
+        # CostModel — FIX #6: fee_rate mindig a TradingConfig.fee_rate-ból jön
         cost_cfg = CostConfig(
-            fee_rate             = cfg.spot_cost.fee_rate,
+            fee_rate             = cfg.fee_rate,        # szinkronizált a főkonfiggal
             slippage_small_usd   = cfg.spot_cost.slippage_small_usd,
             slippage_base_pct    = cfg.spot_cost.slippage_base_pct,
             slippage_impact_pct  = cfg.spot_cost.slippage_impact_pct,
@@ -99,16 +105,28 @@ class Trader:
         ) if cfg.spot_liquidity.enabled else None
         self._liquidity = LiquidityFilter(liq_cfg) if liq_cfg else None
 
-        # DriftDetector
-        drift_cfg = DriftConfig(
-            window          = cfg.spot_drift.window,
-            min_trades      = cfg.spot_drift.min_trades,
-            min_sharpe      = cfg.spot_drift.min_sharpe,
-            min_win_rate    = cfg.spot_drift.min_win_rate,
-            min_profit_factor = cfg.spot_drift.min_profit_factor,
-            min_edge_ratio  = cfg.spot_drift.min_edge_ratio,
-        ) if cfg.spot_drift.enabled else None
-        self._drift = DriftDetector(drift_cfg) if drift_cfg else None
+        # DriftDetector — FIX #5: timeframe-helyes Sharpe annualizáció
+        if cfg.spot_drift.enabled:
+            # Ha annualization_factor=0 → auto kiszámítás a timeframe alapján
+            annual = cfg.spot_drift.annualization_factor
+            if annual <= 0:
+                annual = float(TIMEFRAME_PERIODS_PER_YEAR.get(cfg.timeframe, 365 * 24))
+                logger.info(
+                    "DriftDetector annualization_factor auto: %s TF → %.0f periódus/év",
+                    cfg.timeframe, annual,
+                )
+            drift_cfg = DriftConfig(
+                window              = cfg.spot_drift.window,
+                min_trades          = cfg.spot_drift.min_trades,
+                min_sharpe          = cfg.spot_drift.min_sharpe,
+                min_win_rate        = cfg.spot_drift.min_win_rate,
+                min_profit_factor   = cfg.spot_drift.min_profit_factor,
+                min_edge_ratio      = cfg.spot_drift.min_edge_ratio,
+                annualization_factor= annual,
+            )
+            self._drift: Optional[DriftDetector] = DriftDetector(drift_cfg)
+        else:
+            self._drift = None
 
         # TWAP konfig tárolása (az executor az egyes trade-ekhez jön létre)
         self._twap_cfg = TWAPConfig(
@@ -132,6 +150,17 @@ class Trader:
 
         decision = self.agent.decide(ohlcv)
         timestamp = ohlcv.index[-1]
+
+        # FIX #7: %-os hozamok kiszámítása és tárolása (portfolio kockázathoz)
+        try:
+            closes = ohlcv["close"].tolist()
+            self._last_returns = [
+                (closes[i] - closes[i - 1]) / closes[i - 1]
+                for i in range(1, len(closes))
+                if closes[i - 1] > 0
+            ][-60:]   # utolsó 60 periódus elég a VaR/korreláció számításhoz
+        except Exception:
+            pass
 
         # --- TWAP folyamatban lévő szelet végrehajtása (ha van aktív TWAP) ---
         if self._twap and not self._twap.is_complete():
@@ -169,15 +198,19 @@ class Trader:
                 self.notifier.kill_switch(reason)
             return
 
-        # --- Likviditás szűrő ---
+        # --- Likviditás szűrő --- FIX #1: None → paper/testnet módban kihagyjuk
         if self._liquidity:
-            liq_ok, liq_reason = self._liquidity.check_volume_only(
-                self.config.symbol,
-                volume_24h_usd=self._estimate_volume(decision.price),
-            )
-            if not liq_ok:
-                logger.info("BUY visszautasítva (likviditás): %s", liq_reason)
-                return
+            volume = self._estimate_volume(decision.price)
+            if volume is not None:
+                liq_ok, liq_reason = self._liquidity.check_volume_only(
+                    self.config.symbol,
+                    volume_24h_usd=volume,
+                )
+                if not liq_ok:
+                    logger.info("BUY visszautasítva (likviditás): %s", liq_reason)
+                    return
+            else:
+                logger.debug("Likviditás szűrő kihagyva (paper/testnet mód).")
 
         # --- Kereskedési költség szűrő ---
         if self._cost_model:
@@ -195,17 +228,25 @@ class Trader:
                 return
 
         # --- TWAP döntés (nagy megbízásnál) ---
+        # FIX #4: TWAP paper módban nem működik (PaperBroker nem támogat részleges vételeket)
         order_usd = self.config.risk.max_order_value_usd * self.risk.get_size_multiplier()
         if TWAPExecutor.should_use_twap(order_usd, self._twap_cfg):
-            logger.info("TWAP indítása: %.0f USD, %d szelet", order_usd, self._twap_cfg.num_slices)
-            self._twap = TWAPExecutor(
-                total_size_usd=order_usd,
-                config=self._twap_cfg,
-                fee_rate=self.config.fee_rate,
-            )
-            first_slice = self._twap.start(decision.price, timestamp)
-            self._execute_buy_slice(first_slice.size_usd, decision, timestamp, note="twap_slice_1")
-            return
+            if isinstance(self.broker, PaperBroker):
+                logger.debug(
+                    "TWAP kihagyva (PaperBroker): egyszeri belépés történik %.0f USD-ért.",
+                    order_usd,
+                )
+                # Fall through → normál belépés
+            else:
+                logger.info("TWAP indítása: %.0f USD, %d szelet", order_usd, self._twap_cfg.num_slices)
+                self._twap = TWAPExecutor(
+                    total_size_usd=order_usd,
+                    config=self._twap_cfg,
+                    fee_rate=self.config.fee_rate,
+                )
+                first_slice = self._twap.start(decision.price, timestamp)
+                self._execute_buy_slice(first_slice.size_usd, decision, timestamp, note="twap_slice_1")
+                return
 
         # --- Normál belépés ---
         report = self.broker.buy(decision.price, timestamp)
@@ -229,6 +270,13 @@ class Trader:
                 atr_stop_mult  = atr_stop_mult,
                 max_holding_bars = max_holding,
             )
+
+        # FIX #2: ciklus-info tárolása (SELL note-ban fog megjelenni)
+        self._entry_cycle = (
+            decision.cycle.cycle.value
+            if decision.cycle is not None
+            else ""
+        )
 
         # Perzisztencia + értesítés
         self.db.log_fill(
@@ -257,19 +305,20 @@ class Trader:
                         note: str, fraction: float = 1.0) -> None:
         """Pozíció (részleges) zárása. fraction=1.0: teljes zárás."""
         if fraction < 1.0:
-            # Részleges zárás: a PaperBroker nem támogatja natívan,
-            # itt a teljes pozíciót zárjuk és egy részét visszafizetjük
-            # (közelítés — éles brókerben külön limit order kell)
             logger.info("Részleges zárás: fraction=%.0f%%, price=%.2f, note=%s",
                         fraction * 100, price, note)
-        report = self.broker.sell(price, timestamp, note=note)
+
+        # FIX #2: ciklus-infó hozzáfűzése a note-hoz (performance attribúcióhoz)
+        full_note = f"{note}|cycle:{self._entry_cycle}" if self._entry_cycle else note
+
+        report = self.broker.sell(price, timestamp, note=full_note)
         if report is None:
             return
 
         self.risk.register_trade_pnl(report.pnl)
         self.db.log_fill(
             self.config.symbol, "SELL", report.size, report.price,
-            report.fee, pnl=report.pnl, note=note, timestamp=timestamp,
+            report.fee, pnl=report.pnl, note=full_note, timestamp=timestamp,
         )
         if self.config.notify.notify_on_fill:
             self.notifier.fill("SELL", self.config.symbol, report.size, report.price,
@@ -284,11 +333,12 @@ class Trader:
                 if self.config.notify.notify_on_error:
                     self.notifier.error(f"📉 Modell drift [{drift_status.action}]: {drift_status.note}")
 
-        # ExitManager és TWAP reset
+        # ExitManager, TWAP és ciklus-info reset
         if self._exit_mgr:
             self._exit_mgr.reset()
         if self._twap:
             self._twap = None
+        self._entry_cycle = ""  # FIX #2: ciklus reset a pozíció zárása után
 
         # Kill switch értesítés
         if self.risk.state.halted and self.config.notify.notify_on_kill_switch:
@@ -369,14 +419,35 @@ class Trader:
             self._twap = None
 
     # ------------------------------------------------------------------ #
-    # Volume becslés (orderbook nélkül)
+    # Volume lekérdezés (FIX #1)
     # ------------------------------------------------------------------ #
 
-    def _estimate_volume(self, price: float) -> float:
-        """Durva napi volume becslés ha nincs orderbook adat."""
-        # Fallback: 24h volume becslése a config alapján
-        # Éles módban a BybitBroker.exchange.fetch_ticker() hívható
-        return self.config.risk.max_order_value_usd * 50_000  # nagyon konzervatív
+    def _estimate_volume(self, price: float) -> Optional[float]:
+        """
+        24 órás USD forgalom lekérdezése.
+
+        Visszatérési értékek:
+          - float   : éles BybitBroker esetén a valódi quoteVolume
+          - None    : paper/dry-run módban — a hívó kihagyja a likviditás szűrőt
+
+        FIX #1: korábban hardcoded 50 000×max_order értéket adott vissza,
+        ami mindig átment a szűrőn. Most valódi ticker adatot kérünk.
+        """
+        if isinstance(self.broker, BybitBroker) and not self.broker.dry_run:
+            try:
+                ticker = self.broker.exchange.fetch_ticker(self.config.symbol)
+                vol = float(ticker.get("quoteVolume") or 0.0)
+                logger.debug("[%s] 24h quoteVolume: %.0f USD", self.config.symbol, vol)
+                return vol
+            except Exception as e:
+                logger.warning(
+                    "Volume lekérés sikertelen (%s): %s — likviditás szűrő kihagyva.",
+                    self.config.symbol, e,
+                )
+                return None   # ismeretlen → ne blokkolj, de ne is engedd hamisan
+
+        # Paper / dry-run / testnet: nincs valódi piac → szűrő kihagyása
+        return None
 
     # ------------------------------------------------------------------ #
     # Folyamatos futás + watchdog
