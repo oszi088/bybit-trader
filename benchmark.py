@@ -30,11 +30,11 @@ logging.disable(logging.CRITICAL)
 
 def generate_multi_regime(seed: int = 42) -> pd.DataFrame:
     """
-    2000 1h gyertya, 4 fazisban:
-      0..500    : bull      (drift +0.0008, sigma 0.012)
-      500..1000 : range     (drift  0.0000, sigma 0.015)
-      1000..1500: bear      (drift -0.0010, sigma 0.020)
-      1500..2000: recovery  (drift +0.0012, sigma 0.014)
+    5000 1h gyertya, 4 fazisban:
+      0..1500    : bull      (drift +0.0008, sigma 0.012)
+      1500..3000 : range     (drift  0.0000, sigma 0.015)
+      3000..4000 : bear      (drift -0.0010, sigma 0.020)
+      4000..5000 : recovery  (drift +0.0012, sigma 0.014)
     """
     np.random.seed(seed)
 
@@ -42,10 +42,10 @@ def generate_multi_regime(seed: int = 42) -> pd.DataFrame:
         return np.random.normal(drift, sigma, n)
 
     returns = np.concatenate([
-        segment(500,  0.0008, 0.012),  # bull
-        segment(500,  0.0000, 0.015),  # range
-        segment(500, -0.0010, 0.020),  # bear
-        segment(500,  0.0012, 0.014),  # recovery
+        segment(1500, 0.0008, 0.012),  # bull
+        segment(1500, 0.0000, 0.015),  # range
+        segment(1000,-0.0010, 0.020),  # bear
+        segment(1000, 0.0012, 0.014),  # recovery
     ])
     close = 30000.0 * np.exp(np.cumsum(returns))
     high = close * (1 + np.abs(np.random.normal(0, 0.008, len(close))))
