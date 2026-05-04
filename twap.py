@@ -255,11 +255,14 @@ class TWAPExecutor:
         if self._aborted:
             return None
 
-        # Ár-drift ellenőrzés
+        # Ár-drift ellenőrzés (szimmetrikus: felfelé és lefelé egyaránt)
+        # Felfelé drift: drágábban vásárolunk — abort (eredeti logika)
+        # Lefelé drift: veszélyes piaci esés közben veszünk — abort (crash védelem)
         drift = (current_price - self._start_price) / self._start_price
-        if drift > self.config.max_price_drift_pct:
+        if abs(drift) > self.config.max_price_drift_pct:
+            direction = "emelkedett" if drift > 0 else "esett"
             reason = (
-                f"Áreltérés {drift * 100:.2f}% > limit "
+                f"Áreltérés {drift * 100:.2f}% ({direction}) > ±limit "
                 f"{self.config.max_price_drift_pct * 100:.2f}% "
                 f"(start={self._start_price:.4f}, now={current_price:.4f})"
             )

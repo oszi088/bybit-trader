@@ -229,7 +229,9 @@ def compute_all(df: pd.DataFrame, params) -> pd.DataFrame:
     # Volatilitás
     bb = bollinger_bands(df["close"], params.bb_period, params.bb_std)
     out[["bb_upper", "bb_middle", "bb_lower"]] = bb.values
-    out["atr"] = atr(df, params.atr_period)
+    # Megjegyzés: az `atr` függvénynév nem lehet lokális változóban elrejtve
+    # ebben a scope-ban — véletlenül ne írjuk felül pl. `atr = float(row["atr"])`.
+    out["atr"] = atr(df, params.atr_period)  # atr() = indicators.atr függvény
 
     # Volumen
     out["obv"] = obv(df)

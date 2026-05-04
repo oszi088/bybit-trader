@@ -98,5 +98,9 @@ def build_feature_matrix(
         feats["di_diff_norm"] = (enriched["plus_di"] - enriched["minus_di"]) / (enriched["adx"] + 1e-9)
 
     df = pd.DataFrame(feats, index=ohlcv.index)
-    df = df.ffill().fillna(0.0)
+    # ffill() kitölti a rolling indikátorok "utólagos" NaN-jait (pl. gap utáni bar).
+    # bfill() a warmup-NaN-okat az első érvényes értékkel tölti vissza — jobb
+    # mint a fillna(0.0), ami helytelen baseline-t injektál (pl. ATR=0, RSI=0).
+    # A tanítókód feladata, hogy az első ~max_lookback sort kizárja dropna()-val.
+    df = df.ffill().bfill()
     return df
