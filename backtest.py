@@ -137,10 +137,17 @@ class Backtester:
             # high/low-ja mar lefutott, az uj belepesre valojaban bar i+1-en
             # kerulne sor. Az azonnali ujrabelepes optimista backteszt torzitas.
             if decision.action == "BUY" and position is None and not just_exited_sl_tp:
-                position = _open_position(decision.price, timestamp, cash, cfg, bt_cfg)
-                cash -= position.size * position.entry_price * (1 + cfg.fee_rate)
-                stop_price, tp_price = _initial_stops(position.entry_price, atr, stops)
-                highest_price = position.entry_price
+                # Volatilitás szűrő: túl magas relatív ATR esetén kihagyjuk a belépést
+                atr_pct = atr / price if price > 0 and atr > 0 else 0.0
+                if atr_pct >= cfg.risk.max_atr_pct:
+                    pass  # skip: túl volatilis
+                else:
+                    position = _open_position(
+                        decision.price, timestamp, cash, cfg, bt_cfg, decision.score
+                    )
+                    cash -= position.size * position.entry_price * (1 + cfg.fee_rate)
+                    stop_price, tp_price = _initial_stops(position.entry_price, atr, stops)
+                    highest_price = position.entry_price
 
             elif decision.action == "SELL" and position is not None:
                 cash = _close_position(position, price, timestamp, cash, cfg, bt_cfg, "signal")
@@ -190,9 +197,13 @@ def _apply_slippage(price: float, side: str, bt_cfg) -> float:
     return price * (1 + bps) if side == "BUY" else price * (1 - bps)
 
 
-def _open_position(price: float, timestamp, cash: float, cfg, bt_cfg) -> Trade:
+def _open_position(price: float, timestamp, cash: float, cfg, bt_cfg,
+                   score: float = 1.0) -> Trade:
     fill_price = _apply_slippage(price, "BUY", bt_cfg)
-    notional = cash * cfg.position_size
+    # Score-arányos méretezés (Kelly-szerű): ha be van kapcsolva, a pozíció
+    # mérete arányos a jelzés erősségével (|score| ∈ [threshold, 1.0])
+    size_mult = abs(score) if cfg.risk.score_proportional_size else 1.0
+    notional = cash * cfg.position_size * size_mult
     size = notional / (fill_price * (1 + cfg.fee_rate))
     return Trade(entry_time=timestamp, entry_price=fill_price, size=size)
 
