@@ -73,7 +73,7 @@ def build_feature_matrix_v2(
         "obv", "mfi",
         "sma_fast", "sma_slow", "sma_long",
         "ema_fast", "ema_slow",
-        "bb_upper", "bb_mid", "bb_lower",
+        "bb_upper", "bb_middle", "bb_lower",
         "vwap",
     ]
     for col in raw_cols:

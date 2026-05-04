@@ -29,7 +29,7 @@ _RAW_COLS = [
     "obv", "mfi",
     "sma_fast", "sma_slow", "sma_long",
     "ema_fast", "ema_slow",
-    "bb_upper", "bb_mid", "bb_lower",
+    "bb_upper", "bb_middle", "bb_lower",
     "vwap",
 ]
 
@@ -55,7 +55,7 @@ def build_feature_matrix(
             feats[col] = enriched[col]
 
     # --- Normalizált ár-pozíció a Bollinger-sávon belül (0..1) ---
-    if {"bb_upper", "bb_lower", "bb_mid"}.issubset(enriched.columns):
+    if {"bb_upper", "bb_lower", "bb_middle"}.issubset(enriched.columns):
         bb_range = (enriched["bb_upper"] - enriched["bb_lower"]).replace(0, np.nan)
         feats["bb_pct"] = (ohlcv["close"] - enriched["bb_lower"]) / bb_range
 
