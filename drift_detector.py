@@ -217,11 +217,12 @@ class DriftDetector:
         napi frekvenciáját feltételezve.
         Returns 0.0 ha a szórás nulla.
         """
-        if not pnls:
+        if len(pnls) < 2:
             return 0.0
         n = len(pnls)
         mean = sum(pnls) / n
-        variance = sum((x - mean) ** 2 for x in pnls) / n
+        # ddof=1 (minta-szórás), a pénzügyi Sharpe-számítás sztenderdje
+        variance = sum((x - mean) ** 2 for x in pnls) / (n - 1)
         std = math.sqrt(variance)
         if std == 0.0:
             return 0.0
