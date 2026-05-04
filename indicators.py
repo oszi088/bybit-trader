@@ -235,5 +235,6 @@ def compute_all(df: pd.DataFrame, params) -> pd.DataFrame:
     out["obv"] = obv(df)
     out["vwap"] = vwap(df)
     out["mfi"] = mfi(df, params.mfi_period)
+    out["vol_ma20"] = df["volume"].rolling(20, min_periods=1).mean()
 
     return out
