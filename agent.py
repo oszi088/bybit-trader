@@ -4,10 +4,13 @@ TradingAgent - regime + Fear & Greed + Multi-TimeFrame megerosites.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import pandas as pd
+
+logger = logging.getLogger("agent")
 
 from adaptive_strategy import CycleRegimeParams, get_params
 from altcoin_filter import AltseasonValidator, ValidationResult, CapTier, get_eligible_symbols
@@ -211,8 +214,7 @@ class TradingAgent:
         if self.ml is not None:
             self._features = build_feature_matrix(ohlcv, self.config.indicators)
 
-        import logging as _log
-        _logger = _log.getLogger("agent")
+        # logger már elérhető modulszinten
 
         # Piaci ciklus detektálás a teljes OHLCV history alapján
         try:
@@ -224,7 +226,7 @@ class TradingAgent:
                 vix=vix,
             )
         except Exception as e:
-            _logger.warning("Ciklus detektálás hiba: %s", e)
+            logger.warning("Ciklus detektálás hiba: %s", e)
             self._cycle_state = None
 
         # Alt szezon validáció (csak ha a ciklus azt mutatja)
@@ -239,7 +241,7 @@ class TradingAgent:
                     vix=vix,
                 )
             except Exception as e:
-                _logger.warning("Altseason validáció hiba: %s", e)
+                logger.warning("Altseason validáció hiba: %s", e)
 
         return self._enriched
 
