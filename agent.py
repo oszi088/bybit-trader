@@ -12,6 +12,7 @@ import pandas as pd
 from adaptive_strategy import CycleRegimeParams, get_params
 from altcoin_filter import AltseasonValidator, ValidationResult, CapTier, get_eligible_symbols
 from config import TradingConfig
+from market_timing import MarketTimingAnalyzer, TimingScore
 from fear_greed import FearGreedReading, FearGreedSource
 from indicators import compute_all
 from market_cycle import CycleState, MarketCycle, MarketCycleDetector
@@ -43,6 +44,7 @@ class Decision:
     cycle: Optional[CycleState] = None                    # piaci ciklus állapot
     cycle_params: Optional[CycleRegimeParams] = None      # adaptív paraméterek
     altseason_result: Optional[ValidationResult] = None   # valódi vs. false altseason
+    timing: Optional[TimingScore] = None                  # időalapú aktivitás score
 
     def explain(self) -> str:
         bullish = [n for n, s in self.reasons.items() if s > 0]
@@ -56,11 +58,15 @@ class Decision:
             cycle_part = (f" | cycle={self.cycle.cycle.value}"
                           f"(conf={self.cycle.confidence:.2f}"
                           f",rem~{self.cycle.days_remaining_est}d)")
+        timing_part = ""
+        if self.timing:
+            timing_part = (f" | timing={self.timing.trade_label}"
+                           f"({self.timing.overall:.2f}×{self.timing.position_size_mult:.2f})")
         return (
             f"{self.action} @ {self.price:.2f} | score={self.score:+.2f} "
             f"| regime={self.regime} | F&G={self.fear_greed} "
             f"| MTF={self.mtf_label}({self.mtf_score:+.2f})"
-            f"{ml_part}{cycle_part} | bullish={bullish} bearish={bearish}"
+            f"{ml_part}{cycle_part}{timing_part} | bullish={bullish} bearish={bearish}"
         )
 
 
@@ -94,6 +100,9 @@ class TradingAgent:
             if cycle_state_path else None
         )
         self.altseason_validator = AltseasonValidator(state_path=altseason_state)
+
+        # Időalapú aktivitás elemző
+        self.timing_analyzer = MarketTimingAnalyzer()
 
         # Fear & Greed forras
         if self.config.fear_greed.enabled:
@@ -237,6 +246,23 @@ class TradingAgent:
         fg = self._current_fg()
         signals = self._gather_signals(row, prev_obv, fg.value)
 
+        # ── Időalapú timing score ────────────────────────────────────────
+        from datetime import timezone as _tz
+        ts_dt = (timestamp.to_pydatetime().replace(tzinfo=_tz.utc)
+                 if hasattr(timestamp, "to_pydatetime") else
+                 __import__("datetime").datetime.now(_tz.utc))
+        timing = self.timing_analyzer.score(ts_dt)
+
+        # Hard block: ha a timing teljesen blokkolja a kereskedést
+        if timing.hard_block:
+            return Decision(
+                action="HOLD", score=0.0,
+                price=float(row["close"]),
+                atr=float(row["atr"]) if not pd.isna(row["atr"]) else 0.0,
+                regime=regime.label, fear_greed=fg.value,
+                reasons=signals, timing=timing,
+            )
+
         # MTF analizis (csak ha be van kapcsolva)
         mtf_reading: Optional[MTFReading] = None
         if self.mtf is not None:
@@ -260,10 +286,13 @@ class TradingAgent:
             if action == "SELL" and not cycle_params.allow_short:
                 action = "HOLD"
 
-            # Score threshold módosítás (konzervatívabb / agresszívebb)
+            # Score threshold módosítás — ciklus + timing együtt
             if action == "BUY":
-                effective_threshold = (self.config.buy_threshold
-                                       + cycle_params.score_threshold_delta)
+                effective_threshold = (
+                    self.config.buy_threshold
+                    + cycle_params.score_threshold_delta
+                    + timing.score_threshold_delta
+                )
                 if score < effective_threshold:
                     action = "HOLD"
 
@@ -330,6 +359,7 @@ class TradingAgent:
             cycle=cycle_state,
             cycle_params=cycle_params,
             altseason_result=altseason_result,
+            timing=timing,
         )
 
     def decide(self, ohlcv: pd.DataFrame) -> Decision:
