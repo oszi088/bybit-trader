@@ -13,7 +13,7 @@ import pandas as pd
 logger = logging.getLogger("agent")
 
 from adaptive_strategy import CycleRegimeParams, get_params
-from altcoin_filter import AltseasonValidator, ValidationResult, CapTier, get_eligible_symbols
+from altcoin_filter import AltseasonValidator, ValidationResult, CapTier, get_eligible_symbols, HALVING_SURVIVORS
 from config import TradingConfig
 from market_timing import MarketTimingAnalyzer, TimingScore
 from override_engine import BlockReason, OverrideDecision, OverrideEngine, evaluate_override
@@ -373,13 +373,22 @@ class TradingAgent:
                 if days_in >= 14: allowed_tiers.append(CapTier.MID)
                 if days_in >= 30: allowed_tiers.append(CapTier.SMALL)
 
-                eligible = get_eligible_symbols(
-                    min_halvings=cycle_params.altseason_min_halvings,
-                    cap_tiers=allowed_tiers,
-                )
-                if self._symbol not in eligible:
-                    blocked_reasons.append(BlockReason.ALTSEASON_TIER)
+                # Halving-ellenőrzést külön végezzük, hogy a helyes BlockReason
+                # kerüljön az override motorba: ALTSEASON_HALVING küszöb 0.95
+                # (szinte sosem engedjük felül), ALTSEASON_TIER küszöb 0.82
+                # (tier fokozatos nyitásnál felülírható erős meggyőzéssel).
+                sym_halvings = HALVING_SURVIVORS.get(self._symbol, 0)
+                if sym_halvings < cycle_params.altseason_min_halvings:
+                    blocked_reasons.append(BlockReason.ALTSEASON_HALVING)
                     action = "HOLD"
+                else:
+                    eligible = get_eligible_symbols(
+                        min_halvings=cycle_params.altseason_min_halvings,
+                        cap_tiers=allowed_tiers,
+                    )
+                    if self._symbol not in eligible:
+                        blocked_reasons.append(BlockReason.ALTSEASON_TIER)
+                        action = "HOLD"
 
         # ── Meta-label ML szűrő ──────────────────────────────────────────
         ml_score: Optional[MLScore] = None
