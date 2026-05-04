@@ -152,6 +152,8 @@ class ExitManager:
         self._partial_tp_done: bool = False            # Volt-e már TP1 zárás?
         self._bars_held: int = 0
         self._remaining_fraction: float = 1.0         # Kezdetben 100%, TP1 után 50%
+        # FIX #3: _time_exit_bars példányváltozó, nem a config-ot mutáljuk
+        self._time_exit_bars: int = self.config.time_exit_bars
 
     # -------------------------------------------------------------------------
     # Publikus API
@@ -197,10 +199,9 @@ class ExitManager:
         # Legmagasabb ár: belépési ártól indul
         self._highest_price = entry_price
 
-        # Time exit: az on_entry max_holding_bars felülírja a config értékét,
-        # ha meg van adva (> 0). Így a CycleRegimeParams dinamikusan átadható.
-        if max_holding_bars > 0:
-            self.config.time_exit_bars = max_holding_bars
+        # FIX #3: _time_exit_bars példányváltozóba mentjük, NEM a config-ot mutáljuk.
+        # Így a config újrahasználható marad (pl. backtestben több belépésnél).
+        self._time_exit_bars = max_holding_bars if max_holding_bars > 0 else self.config.time_exit_bars
 
         logger.info(
             "ExitManager.on_entry | entry=%.4f atr=%.4f "
@@ -209,7 +210,7 @@ class ExitManager:
             self._stop_price,
             self._tp1_price,
             self._tp_full_price,
-            self.config.time_exit_bars,
+            self._time_exit_bars,
         )
 
     def on_bar(self, current_price: float, current_atr: float) -> ExitSignal:
@@ -272,7 +273,7 @@ class ExitManager:
         if signal is not None:
             logger.info(
                 "EXIT [time_exit] ár=%.4f bars=%d / max=%d",
-                current_price, self._bars_held, self.config.time_exit_bars,
+                current_price, self._bars_held, self._time_exit_bars,
             )
             return signal
 
@@ -290,6 +291,7 @@ class ExitManager:
         self._partial_tp_done = False
         self._bars_held = 0
         self._remaining_fraction = 1.0
+        self._time_exit_bars = self.config.time_exit_bars  # config default-ra vissza
         logger.debug("ExitManager.reset — állapot törölve.")
 
     def describe(self) -> str:
@@ -307,7 +309,7 @@ class ExitManager:
             f"tp_full={self._tp_full_price:.4f} "
             f"highest={self._highest_price:.4f} "
             f"partial_tp_done={partial_str} "
-            f"bars={self._bars_held}/{self.config.time_exit_bars or '∞'} "
+            f"bars={self._bars_held}/{self._time_exit_bars or '∞'} "
             f"remaining={self._remaining_fraction:.2f}"
         )
 
@@ -464,10 +466,10 @@ class ExitManager:
 
         Ha time_exit_bars == 0, a feltétel ki van kapcsolva.
         """
-        if self.config.time_exit_bars <= 0:
+        if self._time_exit_bars <= 0:
             return None
 
-        if self._bars_held >= self.config.time_exit_bars:
+        if self._bars_held >= self._time_exit_bars:
             return ExitSignal(
                 should_exit=True,
                 is_partial=False,
@@ -476,7 +478,7 @@ class ExitManager:
                 stop_updated=False,
                 new_stop_price=None,
                 note=(
-                    f"Time exit: bars={self._bars_held} >= max={self.config.time_exit_bars} "
+                    f"Time exit: bars={self._bars_held} >= max={self._time_exit_bars} "
                     f"| ár={price:.4f}"
                 ),
             )

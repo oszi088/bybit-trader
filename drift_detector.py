@@ -68,6 +68,10 @@ class DriftConfig:
     reduce_threshold: int = 2
     pause_threshold: int = 3
     stop_threshold: int = 4
+    # FIX #5: Sharpe annualizáció: évi kereskedések száma a használt timeframe-en.
+    # Alapértelmezett 252 = napi. 1h TF-en: 365*24=8760, 4h: 365*6=2190 stb.
+    # Használd a config.TIMEFRAME_PERIODS_PER_YEAR segédszótárat.
+    annualization_factor: float = 252.0
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +225,8 @@ class DriftDetector:
         std = math.sqrt(variance)
         if std == 0.0:
             return 0.0
-        return (mean / std) * math.sqrt(252)
+        # FIX #5: a config.annualization_factor adja a helyes évi skálázást
+        return (mean / std) * math.sqrt(self.config.annualization_factor)
 
     def _compute_metrics(
         self, pnls: list[float]

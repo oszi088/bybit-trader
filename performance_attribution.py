@@ -268,16 +268,21 @@ class PerformanceAttributor:
         """
         if not note:
             return "other"
-        note_lower = note.lower()
+        # FIX #2: az ExitManager által generált note-okhoz igazítva.
+        # A "|cycle:xxx" utótagot levágjuk az elemzés előtt.
+        note_clean = note.split("|")[0].strip().lower()
         for keyword in (
             "stop_loss",
             "take_profit",
             "trailing_stop",
+            "partial_tp",    # ExitManager részleges TP
+            "profit_lock",   # ExitManager profit lock
+            "time_exit",     # ExitManager időalapú exit
             "timeout",
             "manual",
             "signal",
         ):
-            if keyword in note_lower:
+            if keyword in note_clean:
                 return keyword
         return "other"
 
