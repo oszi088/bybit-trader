@@ -60,11 +60,20 @@ def make_labels(
 
         for j in range(i + 1, min(i + 1 + max_holding, n)):
             hold_len = j - i
-            if highs[j] >= tp:
+            tp_hit = highs[j] >= tp
+            sl_hit = lows[j] <= sl
+            if tp_hit and sl_hit:
+                # Mindkét barrier ugyanazon a gyertyán — konzervatív: SL nyer.
+                # A gyertya belső sorrendja ismeretlen; worst-case feltételezés
+                # csökkenti az optimista label-torzítást.
+                result   = -1
+                exit_ret = (sl - entry) / entry
+                break
+            if tp_hit:
                 result   = 1
                 exit_ret = (tp - entry) / entry
                 break
-            if lows[j] <= sl:
+            if sl_hit:
                 result   = -1
                 exit_ret = (sl - entry) / entry
                 break
