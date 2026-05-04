@@ -102,7 +102,10 @@ class CcxtDataSource:
     def fetch_ohlcv(self, limit: int = 200, since: Optional[datetime] = None) -> pd.DataFrame:
         """Lekeri az utolso N gyertya OHLCV-jet."""
         if since is not None:
-            since_ms = int(since.replace(tzinfo=timezone.utc).timestamp() * 1000)
+            # Ha már timezone-aware: .astimezone() konvertál UTC-re.
+            # Ha naive: feltételezzük UTC-t (replace nem konvertál, csak jelöl).
+            _since_utc = since.astimezone(timezone.utc) if since.tzinfo else since.replace(tzinfo=timezone.utc)
+            since_ms = int(_since_utc.timestamp() * 1000)
         else:
             since_ms = None
         raw = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, since=since_ms, limit=limit)
