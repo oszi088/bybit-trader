@@ -60,7 +60,8 @@ class Broker(ABC):
     def entry_price(self) -> Optional[float]: ...
 
     @abstractmethod
-    def buy(self, price: float, timestamp: pd.Timestamp) -> Optional[FillReport]: ...
+    def buy(self, price: float, timestamp: pd.Timestamp,
+            size: Optional[float] = None) -> Optional[FillReport]: ...
 
     @abstractmethod
     def sell(self, price: float, timestamp: pd.Timestamp, note: str = "") -> Optional[FillReport]: ...
@@ -92,11 +93,13 @@ class PaperBroker(Broker):
     def entry_price(self) -> Optional[float]:
         return self._entry_price
 
-    def buy(self, price: float, timestamp: pd.Timestamp) -> Optional[FillReport]:
+    def buy(self, price: float, timestamp: pd.Timestamp,
+            size: Optional[float] = None) -> Optional[FillReport]:
         if self.in_position:
             return None
-        notional = self.cash * self.position_size
-        size = notional / (price * (1 + self.fee_rate))
+        if size is None:
+            notional = self.cash * self.position_size
+            size = notional / (price * (1 + self.fee_rate))
         fee = size * price * self.fee_rate
         self.cash -= size * price + fee
         self.coin_balance = size
@@ -254,18 +257,22 @@ class BybitBroker(Broker):
         except Exception:
             return round(size, 6)
 
-    def buy(self, price: float, timestamp: pd.Timestamp) -> Optional[FillReport]:
+    def buy(self, price: float, timestamp: pd.Timestamp,
+            size: Optional[float] = None) -> Optional[FillReport]:
         if self.in_position:
             return None
 
         # A megrendelést a SZABAD quote egyenleg position_size hányadából méretezzük
-        free_quote = self.fetch_quote_balance()
-        notional = free_quote * self.config.position_size
-        size = self._round_size(notional / price)
+        if size is None:
+            free_quote = self.fetch_quote_balance()
+            notional = free_quote * self.config.position_size
+            size = notional / price
+        size = self._round_size(size)
         if size <= 0:
             logger.warning("Méret 0-ra kerekedett, kihagyva a vételt.")
             return None
 
+        fill_price = price  # fallback: kért ár
         if self.dry_run:
             logger.info("[DRY-RUN] BUY %s %.6f @ %.2f", self.config.symbol, size, price)
         else:
@@ -276,13 +283,15 @@ class BybitBroker(Broker):
                 logger.error("BUY order %s nem toltodott ki (status=%s) - pozicio nem nyilik",
                              order_id, status)
                 return None
-            logger.info("Bybit BUY order: %s (status=%s)", order_id, status)
+            # Tényleges kitöltési ár (average fill) — NEM a request ár
+            fill_price = float(order.get("average") or order.get("price") or price)
+            logger.info("Bybit BUY order: %s (status=%s, fill=%.4f)", order_id, status, fill_price)
 
         # Helyi pozíció vezetése
         self._coin_balance = size
-        self._entry_price = price
-        fee = size * price * self.config.fee_rate
-        report = FillReport("BUY", size, price, fee, timestamp,
+        self._entry_price = fill_price
+        fee = size * fill_price * self.config.fee_rate
+        report = FillReport("BUY", size, fill_price, fee, timestamp,
                             note="dry-run" if self.dry_run else "")
         self.history.append(report)
         return report
