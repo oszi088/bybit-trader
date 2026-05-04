@@ -154,14 +154,18 @@ def obv(df: pd.DataFrame) -> pd.Series:
     return (direction * df["volume"]).cumsum()
 
 
-def vwap(df: pd.DataFrame) -> pd.Series:
+def vwap(df: pd.DataFrame, period: int = 24) -> pd.Series:
     """
-    Volume Weighted Average Price (kumulatív, intraday-szerű számítás).
+    Rolling Volume Weighted Average Price.
+
+    A kumulatív cumsum() az egész dataseten előre tekint (lookahead),
+    ezért rolling ablakot használunk. Az alapértelmezett 24 gyertya
+    1h TF-en egyenlő egy nap VWAP-jával; 4h-on állítsd 6-ra, 1d-n 1-re.
     """
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    cum_vol_price = (typical_price * df["volume"]).cumsum()
-    cum_vol = df["volume"].cumsum().replace(0, np.nan)
-    return cum_vol_price / cum_vol
+    roll_vol_price = (typical_price * df["volume"]).rolling(period, min_periods=1).sum()
+    roll_vol = df["volume"].rolling(period, min_periods=1).sum().replace(0, np.nan)
+    return roll_vol_price / roll_vol
 
 
 def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
