@@ -103,6 +103,7 @@ def run_training(
     agent.prepare(ohlcv)
 
     primary = np.zeros(len(ohlcv), dtype=np.int8)
+    _errors = 0
     for i in range(len(ohlcv)):
         try:
             dec = agent.decide_at(i)
@@ -110,8 +111,22 @@ def run_training(
                 primary[i] = 1
             elif dec.action == "SELL":
                 primary[i] = -1
-        except Exception:
-            pass
+        except Exception as exc:
+            _errors += 1
+            if _errors <= 5:
+                logger.warning("decide_at(%d) hiba: %s", i, exc)
+
+    if _errors > 0:
+        logger.warning("Összesen %d hiba a signal generálásnál (%d sor)", _errors, len(ohlcv))
+
+    n_signals = int((primary != 0).sum())
+    if n_signals == 0:
+        raise RuntimeError(
+            "Egyetlen primary signal sem keletkezett (mind HOLD). "
+            "Ellenőrizd az agent konfigurációt és az adatot."
+        )
+    if n_signals < 50:
+        logger.warning("Csak %d signal (ajánlott >300) — modell valószínűleg megbízhatatlan.", n_signals)
 
     primary_series = pd.Series(primary, index=ohlcv.index, name="primary")
     signal_dist    = pd.Series(primary).value_counts().to_dict()
