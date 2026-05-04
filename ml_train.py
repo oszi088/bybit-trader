@@ -2,14 +2,14 @@
 ML tanítási pipeline.
 
 Munkafolyamat:
-  1. CSV betöltés (fetch_history.py-jal letöltött Binance adat)
-  2. Indikátorok számítása (meglévő indicators.compute_all)
+  1. CSV betöltés (fetch_history.py-jal letöltött adat)
+  2. Indikátorok számítása
   3. Triple barrier labeling (ATR-alapú TP/SL/időlimit)
-  4. Feature matrix építés (ml_features.build_feature_matrix)
-  5. Elsődleges jelrendszer futtatása (TradingAgent.decide_at minden sorra)
+  4. Feature matrix építés
+  5. Elsődleges jelrendszer futtatása (lookahead-mentes F&G)
   6. Meta-label: primary_signal == triple_barrier_label?
-  7. XGBoost tanítás purged walk-forward CV-vel
-  8. Modell mentés .pkl-ba
+  7. Stacking ensemble tanítás purged walk-forward CV-vel
+  8. Modell mentés (joblib)
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def run_training(
     csv_path: str,
     config: Optional[TradingConfig] = None,
     ml_config: Optional[MLConfig] = None,
-    model_out: str = "ml_model.pkl",
+    model_out: str = "ml_model.joblib",
     max_holding: int = 20,
     top_n_features: int = 20,
 ) -> MetaLabelModel:
@@ -46,7 +46,21 @@ def run_training(
     Visszatér a betanított MetaLabelModel példánnyal.
     """
     cfg    = config    or TradingConfig()
-    ml_cfg = ml_config or MLConfig(model_path=model_out)
+    # embargo_bars automatikusan max_holding + 5 buffer, hogy az átfedő
+    # pozíciók ne szivárogassanak info-t a training set-be (#3 fix).
+    if ml_config is None:
+        ml_cfg = MLConfig(
+            model_path   = model_out,
+            embargo_bars = max_holding + 5,
+        )
+    else:
+        ml_cfg = ml_config
+        if ml_cfg.embargo_bars < max_holding:
+            logger.warning(
+                "embargo_bars=%d < max_holding=%d — automatikus korrekció.",
+                ml_cfg.embargo_bars, max_holding,
+            )
+            ml_cfg.embargo_bars = max_holding + 5
 
     # 1. Adat betöltés
     logger.info("Adatok betöltése: %s", csv_path)
@@ -105,18 +119,21 @@ def run_training(
                 signal_dist.get(1, 0), signal_dist.get(0, 0), signal_dist.get(-1, 0))
 
     # 6. Tanítás
-    logger.info("XGBoost tanítás (%d fold, embargo=%.1f%%)...",
-                ml_cfg.n_folds, ml_cfg.embargo_pct * 100)
+    logger.info(
+        "Stacking ensemble tanítás (%d fold, embargo=%d bar / %.1f%%)...",
+        ml_cfg.n_folds, ml_cfg.embargo_bars, ml_cfg.embargo_pct * 100,
+    )
     model = MetaLabelModel(ml_cfg)
     result = model.fit(X, barrier_df["label"], primary_series)
 
     logger.info("=== TANÍTÁS EREDMÉNY ===")
-    logger.info("  Train sorok:   %d", result["train_samples"])
-    logger.info("  Pozitív arány: %.1f%%", result["positive_rate"] * 100)
-    logger.info("  CV accuracy:   %.3f ± %.3f",
+    logger.info("  Train sorok:    %d", result["train_samples"])
+    logger.info("  Pozitív arány:  %.1f%%", result["positive_rate"] * 100)
+    logger.info("  Base learnerek: %d", result["n_base_models"])
+    logger.info("  CV accuracy:    %.3f ± %.3f",
                 result["mean_accuracy"], result["std_accuracy"])
-    for i, acc in enumerate(result["fold_accuracies"], 1):
-        logger.info("    Fold %d: %.3f", i, acc)
+    for base in result.get("base_models", []):
+        logger.info("    [%s] OOF acc=%.3f", base["name"], base["oof_accuracy"])
 
     # 7. Feature importance
     imp = model.feature_importance(top_n=top_n_features)
