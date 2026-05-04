@@ -243,6 +243,8 @@ class AltseasonValidator:
         self._state_path = state_path
         # [(date, dominance)] — max 60 napos rolling buffer
         self._dom_history: List[Tuple[date, float]] = []
+        # [(date, eth_btc_ratio)] — ETH/BTC historikum a trend számításhoz
+        self._eth_btc_history: List[Tuple[date, float]] = []
         self._load_state()
 
     # ------------------------------------------------------------------ #
@@ -303,7 +305,8 @@ class AltseasonValidator:
 
         # ── 5. ETH/BTC emelkedő (broad rotation, nem 1 coin) ─────────────
         if eth_btc_ratio is not None:
-            eth_trend = self._eth_btc_trend(eth_btc_ratio)
+            self._update_eth_btc_history(today, eth_btc_ratio)
+            eth_trend = self._eth_btc_trend()
             if eth_trend >= 0:
                 passed.append("ETH/BTC↑ (vezet az altseason)")
             else:
@@ -319,7 +322,10 @@ class AltseasonValidator:
             failed.append(f"VIX={vix:.0f}≥{self.VIX_PANIC_THRESHOLD} (pánik)")
 
         score = len(passed)
-        confirmed = score >= self.REQUIRED_SCORE and len(failed) == 0
+        # REQUIRED_SCORE = 5 → legalább 5/6 kritérium teljesül
+        # Az `and len(failed) == 0` feltétel REQUIRED_SCORE-t hatástalanná tette
+        # (failed=0 → score=6 mindig), ezért csak score >= REQUIRED_SCORE kell
+        confirmed = score >= self.REQUIRED_SCORE
 
         # Ha megerősített, számítsuk ki az elérhető coinokat
         large, mid, small = [], [], []
@@ -392,17 +398,36 @@ class AltseasonValidator:
                  for i in range(len(recent) - 1)]
         return max(drops) if drops else 0.0
 
-    def _eth_btc_trend(self, current_eth_btc: float) -> float:
+    def _update_eth_btc_history(self, today: date, ratio: float) -> None:
+        """Frissíti az ETH/BTC rolling buffert (max 30 nap)."""
+        self._eth_btc_history = [(d, v) for d, v in self._eth_btc_history if d != today]
+        self._eth_btc_history.append((today, ratio))
+        cutoff = today - timedelta(days=30)
+        self._eth_btc_history = [(d, v) for d, v in self._eth_btc_history if d >= cutoff]
+        self._eth_btc_history.sort(key=lambda x: x[0])
+        self._save_state()
+
+    def _eth_btc_trend(self) -> float:
         """
-        ETH/BTC trend proxy.
-        Ha van historikus dominancia-alapú adat, abból számolunk.
-        Jelenlegi egyszerűsítés: a validator hívó köteles frissíteni
-        a saját ETH/BTC historikumát és a trendértéket átadni.
-        Pozitív = emelkedő, negatív = csökkenő.
+        ETH/BTC 7 napos trend: (aktuális - 7 nappal ezelőtti) / régebbi.
+        Pozitív = emelkedő, negatív = csökkenő, 0.0 = nincs elég adat.
+
+        Adat nélkül (első néhány hívás) semleges 0.0-t ad (nem büntet,
+        de nem is igazol) — a validate() 'n/a' ágába kerül ilyenkor.
         """
-        # Az aktuális implementációban a hívó adja át a trendet (+1/-1/0)
-        # A jövőbeli verzióban a validator saját maga tárolja
-        return current_eth_btc  # ha > 0 → passing, ha < 0 → failing
+        if len(self._eth_btc_history) < 2:
+            return 0.0   # nincs elég historikum → semleges
+        sorted_hist = sorted(self._eth_btc_history, key=lambda x: x[0])
+        current = sorted_hist[-1][1]
+        # Kb. 7 napos visszatekintés
+        ref_date = sorted_hist[-1][0] - timedelta(days=7)
+        older = next(
+            (v for d, v in reversed(sorted_hist[:-1]) if d <= ref_date),
+            sorted_hist[0][1],   # ha nincs 7 nap adat, a legrégebbit vesszük
+        )
+        if older <= 0:
+            return 0.0
+        return (current - older) / older   # pozitív = ETH/BTC emelkedett
 
     # ------------------------------------------------------------------ #
     # JSON perzisztálás
@@ -416,7 +441,11 @@ class AltseasonValidator:
                 "dom_history": [
                     {"date": d.isoformat(), "dom": v}
                     for d, v in self._dom_history
-                ]
+                ],
+                "eth_btc_history": [
+                    {"date": d.isoformat(), "ratio": v}
+                    for d, v in self._eth_btc_history
+                ],
             }
             Path(self._state_path).write_text(
                 json.dumps(data, indent=2), encoding="utf-8"
@@ -435,7 +464,12 @@ class AltseasonValidator:
                 (date.fromisoformat(e["date"]), float(e["dom"]))
                 for e in raw.get("dom_history", [])
             ]
-            logger.info("Altseason állapot betöltve: %d nap", len(self._dom_history))
+            self._eth_btc_history = [
+                (date.fromisoformat(e["date"]), float(e["ratio"]))
+                for e in raw.get("eth_btc_history", [])
+            ]
+            logger.info("Altseason állapot betöltve: %d nap dom, %d nap ETH/BTC",
+                        len(self._dom_history), len(self._eth_btc_history))
         except (OSError, KeyError, ValueError):
             pass
 
