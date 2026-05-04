@@ -240,9 +240,9 @@ class MTFConfig:
     timeframes: list = field(default_factory=lambda: ["6h", "12h", "1d", "1w", "1M"])
 
     # Sulyozas: hosszabb tf nagyobb suly (long-term trend dominal)
+    # Csak az aktív timeframes-ben szereplő tf-ek legyenek itt!
     weights: dict = field(default_factory=lambda: {
         "6h":  0.5,
-        "8h":  0.5,
         "12h": 0.7,
         "1d":  1.0,
         "1w":  1.5,
