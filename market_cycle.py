@@ -314,12 +314,13 @@ class MarketCycleDetector:
 
         _, _, avg_dur = CYCLE_DURATIONS[detected]
         remaining = max(0, avg_dur - days_in)
-        completion = min(1.0, days_in / avg_dur)
+        completion = min(1.0, days_in / avg_dur) if avg_dur > 0 else 0.0
 
         # Konfidencia = legjobb / (legjobb + 2. legjobb)
         sorted_scores = sorted(scores.values(), reverse=True)
-        confidence = (sorted_scores[0] / (sorted_scores[0] + sorted_scores[1])
-                      if len(sorted_scores) > 1 else 1.0)
+        _denom = sorted_scores[0] + sorted_scores[1] if len(sorted_scores) > 1 else sorted_scores[0]
+        confidence = (sorted_scores[0] / _denom
+                      if _denom > 0 else 1.0)
 
         state = CycleState(
             cycle=detected,
