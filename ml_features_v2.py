@@ -71,7 +71,9 @@ def build_feature_matrix_v2(
         "rsi", "macd", "macd_signal", "macd_hist",
         "stoch_k", "stoch_d", "cci",
         "atr", "adx", "plus_di", "minus_di",
-        "obv", "mfi",
+        "mfi",
+        # OBV raw kihagyva: kumulatív összeg, abszolút skálán nem összehasonlítható.
+        # Helyette az obv_delta_5/20 és obv_zscore derived feature-öket használjuk.
         "sma_fast", "sma_slow", "sma_long",
         "ema_fast", "ema_slow",
         "bb_upper", "bb_middle", "bb_lower",
