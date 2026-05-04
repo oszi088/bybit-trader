@@ -152,7 +152,7 @@ class AltDataSource:
                                  "options": {"defaultType": "linear"}})
                 if self.endpoint == "testnet":
                     ex.set_sandbox_mode(True)
-                perp_symbol = self.symbol.replace("/", "/") + ":USDT"
+                perp_symbol = self.symbol.split("/")[0] + "/USDT:USDT"
                 data = ex.fetch_funding_rate(perp_symbol)
                 rate = float(data.get("fundingRate", 0.0))
                 return FundingSnapshot(
