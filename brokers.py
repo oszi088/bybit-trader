@@ -332,8 +332,10 @@ class BybitBroker(Broker):
 
         gross = size * price
         fee = gross * self.config.fee_rate
+        proceeds = gross - fee
         entry = self._entry_price or price
-        pnl = (price - entry) * size - 2 * fee  # közelítés (két oldali díj)
+        # Helyes PnL: nettó bevétel mínusz belépési cost basis (belépési díjjal)
+        pnl = proceeds - size * entry * (1 + self.config.fee_rate)
 
         # Helyi pozíció frissítése — részleges zárás esetén a maradék megmarad
         self._coin_balance -= size
