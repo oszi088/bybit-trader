@@ -47,6 +47,10 @@ class IndicatorParams:
     # Volumen
     mfi_period: int = 14
 
+    # VWAP ablak (0 = auto: az index time-delta alapjan 24 ora)
+    # 1h TF: 24, 1m TF: 1440, 1s TF: 86400 — lasd VWAP_PERIOD_BY_TF
+    vwap_period: int = 0
+
 
 # Gyorsitott parameterek scalpinghoz (1m / 3m / 5m timeframe-ekhez).
 # Minden periodus kb. 50%-kal rovidebb -> az indikator hamarabb reagal.
@@ -60,6 +64,25 @@ SCALPING_INDICATORS = IndicatorParams(
     bb_period=14, bb_std=2.0,
     atr_period=7,
     mfi_period=7,
+)
+
+# HFT parameterek 1s timeframe-hez.
+# 1 perc = 60 bar, 5 perc = 300, 1 ora = 3600.
+# Az indikatorok "hagyomanyos" (pl. RSI-14 = 14 masodperc) helyett
+# percben/oraban ertelmezett ekvivalenst hasznalnak.
+HFT_INDICATORS = IndicatorParams(
+    sma_fast=60,    sma_slow=300,    sma_long=3600,   # 1min / 5min / 1h
+    cross_lookback=60,                                # 1 perces lookback
+    ema_fast=30,    ema_slow=120,    macd_signal=20,  # 30s / 2min
+    adx_period=120,                                   # 2 perces ADX
+    rsi_period=300, rsi_oversold=25.0, rsi_overbought=75.0,  # 5min RSI
+    stoch_k=300,    stoch_d=60,                       # 5min %K, 1min %D
+    stoch_oversold=15.0, stoch_overbought=85.0,       # szukebb savok
+    cci_period=300,                                   # 5min CCI
+    bb_period=300,  bb_std=1.5,                       # 5min BB, szukebb
+    atr_period=120,                                   # 2min ATR
+    mfi_period=300,                                   # 5min MFI
+    vwap_period=86400,                                # 24 oras VWAP
 )
 
 
@@ -124,6 +147,31 @@ SCALPING_WEIGHTS: Dict[str, float] = {
     # Scalpingban az OBI a legfontosabb mikrostruktura signal
     "ob_imbalance":   2.0,
     "ob_large_order": 1.5,
+}
+
+
+# HFT sulyozas 1s timeframe-hez:
+#   - Orderflow (OBI, large_order) a legfontosabb mikrostruktura jelzo
+#   - RSI / Stoch / Bollinger: gyors mean-reversion 1s-en is mukodik
+#   - Fear & Greed, golden/death cross: napi adatok, irrelevansak 1s-en
+HFT_WEIGHTS: Dict[str, float] = {
+    "sma_cross":    0.5,   # 1min/5min SMA → zajos, de trendet jelez
+    "ema_cross":    1.5,   # 30s/2min EMA → gyorsabb reakcio
+    "macd":         1.0,
+    "adx":          0.5,
+    "rsi":          2.0,   # oversold/overbought kritikus
+    "stochastic":   2.0,
+    "cci":          1.0,
+    "bollinger":    1.5,   # mean-reversion 1s-en is mukodik
+    "atr":          0.0,
+    "obv":          0.5,
+    "vwap":         1.5,   # intraday referencia
+    "mfi":          0.8,
+    "fear_greed":   0.0,   # napi adat irrelevans 1s-en
+    "golden_death": 0.0,   # 1h/4h cross → nem hat 1s-re
+    "long_trend":   0.3,   # 1h trend taktiorizalas
+    "ob_imbalance":   2.5, # legfontosabb HFT mikrostruktura jel
+    "ob_large_order": 2.0, # intezmenyi fal
 }
 
 
@@ -426,18 +474,19 @@ class TradingConfig:
 # FIX #5: Evi periodus szam timeframe-enkent (Sharpe annualizaciohoz).
 # Crypto 24/7 piac: 365 nap, nem 252 munkanap.
 TIMEFRAME_PERIODS_PER_YEAR: Dict[str, int] = {
-    "1m":  365 * 24 * 60,   # 525 600
-    "3m":  365 * 24 * 20,   # 175 200
-    "5m":  365 * 24 * 12,   # 105 120
-    "15m": 365 * 24 * 4,    #  35 040
-    "30m": 365 * 24 * 2,    #  17 520
-    "1h":  365 * 24,        #   8 760
-    "2h":  365 * 12,        #   4 380
-    "4h":  365 * 6,         #   2 190
-    "6h":  365 * 4,         #   1 460
-    "8h":  365 * 3,         #   1 095
-    "12h": 365 * 2,         #     730
-    "1d":  365,             #     365
+    "1s":  365 * 24 * 3600,  # 31 536 000
+    "1m":  365 * 24 * 60,    #    525 600
+    "3m":  365 * 24 * 20,    #    175 200
+    "5m":  365 * 24 * 12,    #    105 120
+    "15m": 365 * 24 * 4,     #     35 040
+    "30m": 365 * 24 * 2,     #     17 520
+    "1h":  365 * 24,         #      8 760
+    "2h":  365 * 12,         #      4 380
+    "4h":  365 * 6,          #      2 190
+    "6h":  365 * 4,          #      1 460
+    "8h":  365 * 3,          #      1 095
+    "12h": 365 * 2,          #        730
+    "1d":  365,              #        365
     "1w":  52,
     "1M":  12,
 }
@@ -448,6 +497,7 @@ TIMEFRAME_PERIODS_PER_YEAR: Dict[str, int] = {
 # de ne pazaroljuk a CCXT rate-limitet (Bybit ~120 req/sec/IP, de spot
 # 50 req/sec biztos hatar).
 TIMEFRAME_POLL_SECONDS: Dict[str, int] = {
+    "1s": 1,
     "1m": 10,    "3m": 20,    "5m": 30,
     "15m": 60,   "30m": 90,   "1h": 60,
     "2h": 120,   "4h": 180,   "6h": 300,
@@ -456,13 +506,23 @@ TIMEFRAME_POLL_SECONDS: Dict[str, int] = {
 }
 
 
+# VWAP gorduloablak timeframe-enkent (24 oras ekvivalens, kerekitve).
+# compute_all() automatikusan kivalasztja a helyes erteket ha vwap_period=0.
+VWAP_PERIOD_BY_TF: Dict[str, int] = {
+    "1s":  86400,  "1m":  1440,  "3m":  480,  "5m":  288,
+    "15m": 96,     "30m": 48,    "1h":  24,   "2h":  12,
+    "4h":  6,      "6h":  4,     "8h":  3,    "12h": 2,
+    "1d":  1,      "1w":  1,     "1M":  1,
+}
+
+
 def poll_interval_for_timeframe(tf: str) -> int:
     """Optimalis poll periodus egy adott timeframe-hez."""
     return TIMEFRAME_POLL_SECONDS.get(tf, 60)
 
 
-# Sub-5min timeframe-ek (scalping)
-GRANULAR_TIMEFRAMES = {"1m", "3m", "5m"}
+# Sub-1min timeframe-ek (scalping + HFT)
+GRANULAR_TIMEFRAMES = {"1s", "1m", "3m", "5m"}
 
 
 def is_granular_timeframe(tf: str) -> bool:
@@ -530,4 +590,65 @@ def make_scalping_config(
     cfg.mtf.sma_slow = 21
     # Watchdog: 1m-en max 5 perc nemasag mar gyanus
     cfg.watchdog.max_silent_seconds = 300
+    return cfg
+
+
+def make_hft_config(
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1s",
+    exchange_id: str = "binance",
+) -> "TradingConfig":
+    """
+    1 masodperces HFT-re hangolt TradingConfig.
+
+    Binance az elodleges forrás: az egyetlen exchange, amelyen 1s OHLCV
+    historikus adat letoltheto (data.binance.vision bulk download).
+
+    Mit valtoztatunk a scalping confighoz kepest:
+      * HFT_INDICATORS: periodusok percekre/orakra skalazva (lasd fent)
+      * HFT_WEIGHTS: F&G=0, golden/death=0; OBI+large_order dominalnak
+      * MTF: 1m, 5m, 15m, 1h (minden TF feljebb tolva eggyel)
+      * ATR stopok meg szukebbek (0.8* / 1.2*ATR) — 1s savon kicsi a mozgas
+      * max_atr_pct: 0.01 (1%) — 1s bar szinte sosem mozog 1%-ot
+      * threshold: 0.60 / -0.60 — nagyon eros konszenzus kell (zaj miatt)
+      * position_size: 0.20 — kis egyseg, gyors re-entry
+      * VectorizedBacktester ajanlott: 86400 bar/nap → lassu az alap Backtester
+    """
+    cfg = TradingConfig(
+        symbol=symbol,
+        timeframe=timeframe,
+        exchange_id=exchange_id,
+        bybit_endpoint="global",      # Binance-hez nem relevans, de beallitjuk
+        poll_interval_sec=1,
+        buy_threshold=0.60,
+        sell_threshold=-0.60,
+        position_size=0.20,
+        indicators=HFT_INDICATORS,
+        weights=dict(HFT_WEIGHTS),
+    )
+    # Szukebb ATR stopok: 1s sav kicsiny
+    cfg.stops.atr_stop_mult = 0.8
+    cfg.stops.atr_tp_mult   = 1.2
+    cfg.stops.use_trailing_stop = False   # VectorizedBacktester nem tamogatja
+    # Volatilitas szuro: 1s bar ATR/ar aranyan kell szurni
+    cfg.risk.max_atr_pct = 0.01
+    cfg.risk.max_order_value_usd = 20.0
+    # Regime: 1s-en az ADX ertekelese nehezebb, tolekcetesebb kuszobok
+    cfg.regime.adx_trend_threshold = 25.0
+    cfg.regime.adx_range_threshold = 15.0
+    # F&G: nem hasznalt 1s-en
+    cfg.fear_greed.enabled = False
+    # MTF: 1s-es cascade (1m, 5m, 15m, 1h)
+    cfg.mtf.timeframes = ["1m", "5m", "15m", "1h"]
+    cfg.mtf.weights = {
+        "1m":  0.5,
+        "5m":  1.0,
+        "15m": 1.5,
+        "1h":  2.0,
+    }
+    cfg.mtf.composite_weight = 1.0
+    cfg.mtf.sma_fast = 60     # 1 perces SMA
+    cfg.mtf.sma_slow = 300    # 5 perces SMA
+    # Watchdog: 1s-en 30 masodperc nemasag mar gyanus
+    cfg.watchdog.max_silent_seconds = 30
     return cfg
