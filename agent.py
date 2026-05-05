@@ -346,10 +346,16 @@ class TradingAgent:
             blocked_reasons.append(BlockReason.TIMING_HARD)
             action = "HOLD"
         elif action in ("BUY", "SELL"):
-            effective_base = self.config.buy_threshold + timing.score_threshold_delta
-            if action == "BUY" and score < effective_base:
-                blocked_reasons.append(BlockReason.TIMING_THRESHOLD)
-                action = "HOLD"
+            if action == "BUY":
+                effective_base = self.config.buy_threshold + timing.score_threshold_delta
+                if score < effective_base:
+                    blocked_reasons.append(BlockReason.TIMING_THRESHOLD)
+                    action = "HOLD"
+            else:  # SELL
+                effective_base = self.config.sell_threshold - timing.score_threshold_delta
+                if score > effective_base:
+                    blocked_reasons.append(BlockReason.TIMING_THRESHOLD)
+                    action = "HOLD"
 
         # ── Ciklus-adaptív szűrők ────────────────────────────────────────
         cycle_state = self._cycle_state
