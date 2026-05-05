@@ -339,12 +339,13 @@ class TestBacktestHelpers:
         assert _apply_slippage(30000.0, "SELL", bt) < 30000.0
 
     def test_open_position_score_proportional(self):
-        """score=0.5 → felakkora pozíció mint score=1.0"""
+        """score=0.5 → felakkora pozíció mint score=1.0 (notional fallback)"""
         cfg = TradingConfig()
         cfg.risk.score_proportional_size = True
+        cfg.risk.use_fixed_risk_sizing = False   # notional mód: stop nélkül is megy
         ts = pd.Timestamp("2024-01-01", tz="UTC")
-        pos_full = _open_position(30000.0, ts, 10000.0, cfg, cfg.backtest, score=1.0)
-        pos_half = _open_position(30000.0, ts, 10000.0, cfg, cfg.backtest, score=0.5)
+        pos_full = _open_position(30000.0, None, ts, 10000.0, cfg, cfg.backtest, score=1.0)
+        pos_half = _open_position(30000.0, None, ts, 10000.0, cfg, cfg.backtest, score=0.5)
         assert pos_full.size > pos_half.size
         assert pos_half.size == pytest.approx(pos_full.size * 0.5, rel=0.01)
 
@@ -352,10 +353,36 @@ class TestBacktestHelpers:
         """score_proportional_size=False → score-tól független méret"""
         cfg = TradingConfig()
         cfg.risk.score_proportional_size = False
+        cfg.risk.use_fixed_risk_sizing = False
         ts = pd.Timestamp("2024-01-01", tz="UTC")
-        p1 = _open_position(30000.0, ts, 10000.0, cfg, cfg.backtest, score=0.8)
-        p2 = _open_position(30000.0, ts, 10000.0, cfg, cfg.backtest, score=0.4)
+        p1 = _open_position(30000.0, None, ts, 10000.0, cfg, cfg.backtest, score=0.8)
+        p2 = _open_position(30000.0, None, ts, 10000.0, cfg, cfg.backtest, score=0.4)
         assert p1.size == pytest.approx(p2.size, rel=0.001)
+
+    def test_open_position_risk_sizing_uses_stop_distance(self):
+        """risk sizing: tágabb stop → kisebb pozíció ugyanakkora kockázatnál"""
+        cfg = TradingConfig()
+        cfg.risk.use_fixed_risk_sizing = True
+        cfg.risk.risk_per_trade_pct = 0.01
+        cfg.risk.score_proportional_size = False
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        # Szoros stop: 1000 USD távolság
+        pos_tight = _open_position(30000.0, 29000.0, ts, 10000.0, cfg, cfg.backtest)
+        # Tág stop: 3000 USD távolság
+        pos_wide  = _open_position(30000.0, 27000.0, ts, 10000.0, cfg, cfg.backtest)
+        assert pos_tight.size > pos_wide.size
+
+    def test_open_position_risk_sizing_respects_max_cap(self):
+        """risk sizing: nagyon szoros stop sem adhat position_size-nál nagyobb pozíciót"""
+        cfg = TradingConfig()
+        cfg.risk.use_fixed_risk_sizing = True
+        cfg.risk.risk_per_trade_pct = 0.01
+        cfg.position_size = 0.95
+        ts = pd.Timestamp("2024-01-01", tz="UTC")
+        # 1 USD stop → óriási számolt méret, de cap-elni kell
+        pos = _open_position(30000.0, 29999.0, ts, 10000.0, cfg, cfg.backtest)
+        max_size = 10000.0 * 0.95 / (30000.0 * 1.001)
+        assert pos.size <= max_size * 1.01  # kis tűrés a slippage miatt
 
 
 # ===========================================================================

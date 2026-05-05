@@ -156,6 +156,13 @@ class RiskConfig:
     # (azaz 0.6-os score 60%-os meretu belepest ad)
     score_proportional_size: bool = True
 
+    # Fix kockazat per trade (profi modszer):
+    #   Ha True, a poziciomeret a stop tavolsagabol kovetkezik:
+    #     size = (capital * risk_per_trade_pct) / stop_distance
+    #   Ha False (fallback): notional = capital * position_size (regi logika)
+    use_fixed_risk_sizing: bool = True
+    risk_per_trade_pct: float = 0.01   # toke 1%-at kockaztatjuk tradeenkent
+
     # Volatilitas-szuro: ha az ATR/ar arany >= ez az ertek, ne nyissunk uj poziciot
     max_atr_pct: float = 0.05   # 5%-nal magasabb relativ ATR -> kihagyjuk
 

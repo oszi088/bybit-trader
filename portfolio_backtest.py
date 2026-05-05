@@ -30,8 +30,11 @@ import pandas as pd
 
 from agent import TradingAgent
 from backtest import (
-    _apply_slippage, _check_sl_tp, _close_position,
-    _initial_stops, _max_drawdown, Trade,
+    _apply_slippage, _calc_size,
+    _check_sl_tp, _check_sl_tp_short,
+    _close_position, _close_short,
+    _initial_stops, _initial_stops_short,
+    _mark_position, _max_drawdown, Trade,
 )
 from config import TradingConfig
 
@@ -92,6 +95,8 @@ class _Slot:
     stop_price: Optional[float]
     tp_price: Optional[float]
     highest_price: float
+    lowest_price: float = 0.0   # short trailing
+    bars: int = 0               # max_holding számlálóhoz
 
 
 # ============================================================================
@@ -157,7 +162,13 @@ class PortfolioBacktester:
         for ts in all_ts:
             just_exited: Set[str] = set()
 
-            # --- SL / TP ellenőrzés (bar high/low alapján) ------------------
+            # --- Döntések előre (cycle_params kell a max_holding-hoz is) -----
+            decisions = {}
+            for sym, agent in agents.items():
+                if ts in ts_to_idx.get(sym, {}):
+                    decisions[sym] = agent.decide_at(ts_to_idx[sym][ts])
+
+            # --- Trailing stop + SL/TP + max_holding -------------------------
             for sym in list(slots.keys()):
                 if ts not in ts_to_idx.get(sym, {}):
                     continue
@@ -166,75 +177,128 @@ class PortfolioBacktester:
                 slot = slots[sym]
                 price = float(row["close"])
                 atr = float(row["atr"]) if not pd.isna(row["atr"]) else 0.0
+                slot.bars += 1
+
+                # Cycle params a max_holding-hoz
+                dec = decisions.get(sym)
+                cp = dec.cycle_params if dec else None
+                max_hold = cp.max_holding_bars if cp else 9_999
 
                 # Trailing stop frissítés
                 if stops.use_trailing_stop:
-                    if price > slot.highest_price:
-                        slot.highest_price = price
-                    if atr > 0:
-                        new_stop = slot.highest_price - stops.trailing_atr_mult * atr
-                        if slot.stop_price is None or new_stop > slot.stop_price:
-                            slot.stop_price = new_stop
+                    if slot.trade.direction == "long":
+                        if price > slot.highest_price:
+                            slot.highest_price = price
+                        if atr > 0:
+                            new_sl = slot.highest_price - stops.trailing_atr_mult * atr
+                            if slot.stop_price is None or new_sl > slot.stop_price:
+                                slot.stop_price = new_sl
+                    else:  # short
+                        if slot.lowest_price == 0.0 or price < slot.lowest_price:
+                            slot.lowest_price = price
+                        if atr > 0:
+                            new_sl = slot.lowest_price + stops.trailing_atr_mult * atr
+                            if slot.stop_price is None or new_sl < slot.stop_price:
+                                slot.stop_price = new_sl
 
-                exit_reason = _check_sl_tp(row, slot.stop_price, slot.tp_price)
-                if exit_reason is not None:
-                    fill = slot.stop_price if exit_reason == "stop_loss" else slot.tp_price
-                    cash = _close_position(
-                        slot.trade, fill or price, ts, cash, cfg, bt_cfg, exit_reason
-                    )
+                # SL/TP
+                if slot.trade.direction == "long":
+                    exit_r = _check_sl_tp(row, slot.stop_price, slot.tp_price)
+                else:
+                    exit_r = _check_sl_tp_short(row, slot.stop_price, slot.tp_price)
+
+                if exit_r is None and slot.bars >= max_hold:
+                    exit_r = "max_holding"
+
+                if exit_r is not None:
+                    fill = (slot.stop_price if exit_r == "stop_loss"
+                            else slot.tp_price if exit_r == "take_profit"
+                            else price)
+                    if slot.trade.direction == "long":
+                        cash = _close_position(slot.trade, fill or price, ts,
+                                               cash, cfg, bt_cfg, exit_r)
+                    else:
+                        cash = _close_short(slot.trade, fill or price, ts,
+                                            cash, cfg, bt_cfg, exit_r)
                     all_trades.append(slot.trade)
                     del slots[sym]
                     just_exited.add(sym)
 
-            # --- Ügynök döntések és belépések / jelzés alapú kilépések ------
-            for sym, agent in agents.items():
+            # --- Belépések / jelzés alapú kilépések --------------------------
+            for sym, dec in decisions.items():
+                if sym in just_exited:
+                    continue
                 if ts not in ts_to_idx.get(sym, {}):
                     continue
                 idx = ts_to_idx[sym][ts]
                 row = enriched[sym].iloc[idx]
                 price = float(row["close"])
                 atr = float(row["atr"]) if not pd.isna(row["atr"]) else 0.0
-                decision = agent.decide_at(idx)
 
-                if (decision.action == "BUY"
-                        and sym not in slots
-                        and sym not in just_exited
-                        and len(slots) < self.max_positions
-                        and cash >= slot_size * 0.5):
+                cp = dec.cycle_params
+                allow_long  = cp.allow_long  if cp else True
+                allow_short = cp.allow_short if cp else False
 
-                    atr_pct = atr / price if price > 0 and atr > 0 else 0.0
-                    if atr_pct >= cfg.risk.max_atr_pct:
-                        continue   # túl volatilis
+                if dec.action == "BUY":
+                    if sym in slots and slots[sym].trade.direction == "short":
+                        # Short zárása
+                        cash = _close_short(slots[sym].trade, price, ts,
+                                            cash, cfg, bt_cfg, "signal")
+                        all_trades.append(slots[sym].trade)
+                        del slots[sym]
 
-                    alloc = min(slot_size, cash)
-                    size_mult = abs(decision.score) if cfg.risk.score_proportional_size else 1.0
-                    fill = _apply_slippage(price, "BUY", bt_cfg)
-                    size = alloc * size_mult / (fill * (1 + cfg.fee_rate))
+                    elif (sym not in slots and allow_long
+                          and len(slots) < self.max_positions
+                          and cash >= slot_size * 0.5):
+                        atr_pct = atr / price if price > 0 and atr > 0 else 0.0
+                        if atr_pct < cfg.risk.max_atr_pct:
+                            fill = _apply_slippage(price, "BUY", bt_cfg)
+                            sl, tp = _initial_stops(fill, atr, stops)
+                            alloc = min(slot_size, cash)
+                            # Risk-alapú méret a slot-on belül
+                            size = _calc_size(fill, sl, alloc, cfg, bt_cfg, dec.score)
+                            if size > 0:
+                                trade = PortfolioTrade(entry_time=ts, entry_price=fill,
+                                                       size=size, symbol=sym,
+                                                       direction="long")
+                                cash -= size * fill * (1 + cfg.fee_rate)
+                                slots[sym] = _Slot(trade, sl, tp,
+                                                   highest_price=fill,
+                                                   lowest_price=fill)
 
-                    trade = PortfolioTrade(
-                        entry_time=ts,
-                        entry_price=fill,
-                        size=size,
-                        symbol=sym,
-                    )
-                    cash -= size * fill * (1 + cfg.fee_rate)
-                    sl, tp = _initial_stops(fill, atr, stops)
-                    slots[sym] = _Slot(trade, sl, tp, fill)
+                elif dec.action == "SELL":
+                    if sym in slots and slots[sym].trade.direction == "long":
+                        # Long zárása
+                        cash = _close_position(slots[sym].trade, price, ts,
+                                               cash, cfg, bt_cfg, "signal")
+                        all_trades.append(slots[sym].trade)
+                        del slots[sym]
 
-                elif decision.action == "SELL" and sym in slots:
-                    slot = slots[sym]
-                    cash = _close_position(
-                        slot.trade, price, ts, cash, cfg, bt_cfg, "signal"
-                    )
-                    all_trades.append(slot.trade)
-                    del slots[sym]
+                    elif (sym not in slots and allow_short
+                          and len(slots) < self.max_positions
+                          and cash >= slot_size * 0.5):
+                        atr_pct = atr / price if price > 0 and atr > 0 else 0.0
+                        if atr_pct < cfg.risk.max_atr_pct:
+                            fill = _apply_slippage(price, "SELL", bt_cfg)
+                            sl, tp = _initial_stops_short(fill, atr, stops)
+                            alloc = min(slot_size, cash)
+                            size = _calc_size(fill, sl, alloc, cfg, bt_cfg, dec.score)
+                            if size > 0:
+                                trade = PortfolioTrade(entry_time=ts, entry_price=fill,
+                                                       size=size, symbol=sym,
+                                                       direction="short")
+                                cash -= size * fill * (1 + cfg.fee_rate)
+                                slots[sym] = _Slot(trade, sl, tp,
+                                                   highest_price=fill,
+                                                   lowest_price=fill)
 
             # --- Equity mark-to-market --------------------------------------
             mark = cash
             for sym, slot in slots.items():
                 if ts in ts_to_idx.get(sym, {}):
                     idx = ts_to_idx[sym][ts]
-                    mark += slot.trade.size * float(enriched[sym].iloc[idx]["close"])
+                    cur = float(enriched[sym].iloc[idx]["close"])
+                    mark += _mark_position(slot.trade, cur)
             equity_history.append(mark)
             equity_index.append(ts)
 
@@ -242,9 +306,12 @@ class PortfolioBacktester:
         for sym, slot in list(slots.items()):
             last_price = float(enriched[sym].iloc[-1]["close"])
             last_ts = enriched[sym].index[-1]
-            cash = _close_position(
-                slot.trade, last_price, last_ts, cash, cfg, bt_cfg, "end_of_data"
-            )
+            if slot.trade.direction == "long":
+                cash = _close_position(slot.trade, last_price, last_ts,
+                                       cash, cfg, bt_cfg, "end_of_data")
+            else:
+                cash = _close_short(slot.trade, last_price, last_ts,
+                                    cash, cfg, bt_cfg, "end_of_data")
             all_trades.append(slot.trade)
 
         # ── 5. Eredmény ──────────────────────────────────────────────────────
