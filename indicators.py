@@ -237,7 +237,20 @@ def compute_all(df: pd.DataFrame, params) -> pd.DataFrame:
 
     # Volumen
     out["obv"] = obv(df)
-    out["vwap"] = vwap(df)
+
+    # VWAP gorduloablak: params.vwap_period=0 → auto-detect az index time-delta alapjan
+    _vwap_p = params.vwap_period
+    if _vwap_p <= 0:
+        try:
+            if len(df) >= 2 and hasattr(df.index, "__getitem__"):
+                _delta_s = (df.index[1] - df.index[0]).total_seconds()
+                _vwap_p = max(1, int(86400 / _delta_s)) if _delta_s > 0 else 24
+            else:
+                _vwap_p = 24
+        except Exception:
+            _vwap_p = 24
+    out["vwap"] = vwap(df, _vwap_p)
+
     out["mfi"] = mfi(df, params.mfi_period)
     out["vol_ma20"] = df["volume"].rolling(20, min_periods=1).mean()
 
