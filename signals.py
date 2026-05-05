@@ -270,3 +270,181 @@ def signal_ob_large_order(row: pd.Series) -> int:
     if v is None or pd.isna(v):
         return 0
     return int(v)
+
+
+# --------------------------------------------------------------------------- #
+# Vektorizált batch szignál-számítás (VectorizedBacktester / nagy adathalmaz)
+# --------------------------------------------------------------------------- #
+
+import numpy as np  # noqa: E402  (a fájl tetején is be van importálva a pd, de np nem)
+
+
+def compute_signal_matrix(
+    enriched: pd.DataFrame,
+    params: "IndicatorParams",
+    fg_value: int = 50,
+) -> pd.DataFrame:
+    """
+    Teljes szignálmátrix egy numpy pass-ban: ~1000× gyorsabb mint
+    soronkénti signal_xxx() hívás.
+
+    Paraméterek:
+        enriched : compute_all() által kiegészített OHLCV DataFrame
+        params   : IndicatorParams (rsi_oversold, stoch_oversold, stb.)
+        fg_value : Fear & Greed skalar (egész futásra egy érték)
+
+    Visszatér:
+        DataFrame, shape=(len(enriched), 17), dtype=int8, értékek {-1, 0, 1}
+        Oszlopok: sma_cross, ema_cross, macd, adx, rsi, stochastic, cci,
+                  bollinger, atr, obv, vwap, mfi, fear_greed,
+                  golden_death, long_trend, ob_imbalance, ob_large_order
+    """
+    idx = enriched.index
+    n = len(enriched)
+
+    def _sign3(pos: np.ndarray, neg: np.ndarray) -> np.ndarray:
+        """Bool → int8 {+1, 0, -1}"""
+        return np.where(pos, np.int8(1), np.where(neg, np.int8(-1), np.int8(0))).astype(np.int8)
+
+    def _col(name, default=np.nan):
+        return enriched[name].values if name in enriched.columns else np.full(n, default)
+
+    close = _col("close")
+
+    # ── Trend ────────────────────────────────────────────────────────────── #
+    sma_f = _col("sma_fast"); sma_s = _col("sma_slow")
+    ok = ~np.isnan(sma_f) & ~np.isnan(sma_s)
+    sma_cross = np.where(ok, _sign3(sma_f > sma_s, sma_f < sma_s), np.int8(0)).astype(np.int8)
+
+    ema_f = _col("ema_fast"); ema_s = _col("ema_slow")
+    ok = ~np.isnan(ema_f) & ~np.isnan(ema_s)
+    ema_cross = np.where(ok, _sign3(ema_f > ema_s, ema_f < ema_s), np.int8(0)).astype(np.int8)
+
+    hist = _col("macd_hist")
+    macd_sig = np.where(~np.isnan(hist), _sign3(hist > 0, hist < 0), np.int8(0)).astype(np.int8)
+
+    adx_v = _col("adx"); plus_di = _col("plus_di"); minus_di = _col("minus_di")
+    ok = ~np.isnan(adx_v) & ~np.isnan(plus_di) & ~np.isnan(minus_di)
+    strong = adx_v >= 20
+    adx_sig = np.where(ok, _sign3(strong & (plus_di > minus_di),
+                                   strong & (minus_di > plus_di)), np.int8(0)).astype(np.int8)
+
+    # ── Momentum ──────────────────────────────────────────────────────────── #
+    rsi_v = _col("rsi")
+    rsi_sig = np.where(~np.isnan(rsi_v),
+                       _sign3(rsi_v < params.rsi_oversold, rsi_v > params.rsi_overbought),
+                       np.int8(0)).astype(np.int8)
+
+    k = _col("stoch_k"); d = _col("stoch_d")
+    ok = ~np.isnan(k) & ~np.isnan(d)
+    stoch_sig = np.where(ok,
+        _sign3((k < params.stoch_oversold) & (k > d),
+               (k > params.stoch_overbought) & (k < d)),
+        np.int8(0)).astype(np.int8)
+
+    cci_v = _col("cci")
+    cci_sig = np.where(~np.isnan(cci_v),
+                       _sign3(cci_v < -100, cci_v > 100),
+                       np.int8(0)).astype(np.int8)
+
+    # ── Volatilitás ───────────────────────────────────────────────────────── #
+    bb_u = _col("bb_upper"); bb_l = _col("bb_lower")
+    ok = ~np.isnan(bb_u) & ~np.isnan(bb_l)
+    boll_sig = np.where(ok, _sign3(close < bb_l, close > bb_u), np.int8(0)).astype(np.int8)
+
+    atr_sig = np.zeros(n, dtype=np.int8)   # ATR mindig 0 (volatilitás-szűrő, nem irány)
+
+    # ── Volumen ───────────────────────────────────────────────────────────── #
+    obv_v = _col("obv", 0.0)
+    prev_obv = np.empty(n); prev_obv[0] = np.nan; prev_obv[1:] = obv_v[:-1]
+    ok = ~np.isnan(obv_v) & ~np.isnan(prev_obv)
+    obv_sig = np.where(ok, _sign3(obv_v > prev_obv, obv_v < prev_obv), np.int8(0)).astype(np.int8)
+
+    vwap_v = _col("vwap")
+    vwap_sig = np.where(~np.isnan(vwap_v),
+                        _sign3(close > vwap_v, close < vwap_v),
+                        np.int8(0)).astype(np.int8)
+
+    mfi_v = _col("mfi")
+    mfi_sig = np.where(~np.isnan(mfi_v),
+                       _sign3(mfi_v < 20, mfi_v > 80),
+                       np.int8(0)).astype(np.int8)
+
+    # ── Makro / hosszú táv ────────────────────────────────────────────────── #
+    fg_scalar = signal_fear_greed(fg_value)
+    fg_col = np.full(n, fg_scalar, dtype=np.int8)
+
+    g_raw = _col("recent_golden", 0.0); d_raw = _col("recent_death", 0.0)
+    g = np.nan_to_num(g_raw).astype(int); d_c = np.nan_to_num(d_raw).astype(int)
+    gd_sig = _sign3((g > 0) & (d_c == 0), (d_c > 0) & (g == 0))
+
+    sma_s2 = _col("sma_slow"); sma_l = _col("sma_long")
+    ok = ~np.isnan(sma_s2) & ~np.isnan(sma_l)
+    lt_sig = np.where(ok, _sign3(sma_s2 > sma_l, sma_s2 < sma_l), np.int8(0)).astype(np.int8)
+
+    # ── Orderflow ─────────────────────────────────────────────────────────── #
+    obi = np.nan_to_num(_col("ob_imbalance", 0.0))
+    obi_sig = _sign3(obi > 0.20, obi < -0.20)
+
+    olo = np.nan_to_num(_col("ob_large_order", 0.0)).astype(int)
+    olo_sig = np.clip(olo, -1, 1).astype(np.int8)
+
+    return pd.DataFrame({
+        "sma_cross":    sma_cross,  "ema_cross":  ema_cross,
+        "macd":         macd_sig,   "adx":        adx_sig,
+        "rsi":          rsi_sig,    "stochastic": stoch_sig,
+        "cci":          cci_sig,    "bollinger":  boll_sig,
+        "atr":          atr_sig,    "obv":        obv_sig,
+        "vwap":         vwap_sig,   "mfi":        mfi_sig,
+        "fear_greed":   fg_col,     "golden_death": gd_sig,
+        "long_trend":   lt_sig,     "ob_imbalance": obi_sig,
+        "ob_large_order": olo_sig,
+    }, index=idx, dtype=np.int8)
+
+
+def compute_scores_with_regime(
+    signal_matrix: pd.DataFrame,
+    enriched: pd.DataFrame,
+    regime_cfg: "RegimeConfig",
+    weights_default: dict,
+    weights_trend: dict,
+    weights_range: dict,
+) -> np.ndarray:
+    """
+    Per-bar súlyozott score vektorizáltan, regime-adaptív súlyokkal.
+
+    Az ADX értéke alapján minden bárhoz a megfelelő súlyvektort választja:
+      ADX ≥ adx_trend_threshold → TREND_WEIGHTS
+      ADX ≤ adx_range_threshold → RANGE_WEIGHTS
+      köztes / NaN             → DEFAULT_WEIGHTS
+
+    Returns: float64 numpy array, len=len(signal_matrix), értékek ∈ [-1, 1]
+    """
+    cols = list(signal_matrix.columns)
+    sig_arr = signal_matrix.values.astype(np.float64)   # (n, 17)
+
+    def _wvec(w: dict) -> np.ndarray:
+        return np.array([w.get(c, 0.0) for c in cols], dtype=np.float64)
+
+    w_def   = _wvec(weights_default)
+    w_trend = _wvec(weights_trend)
+    w_range = _wvec(weights_range)
+
+    norm_def   = max(float(np.sum(np.abs(w_def))),   1e-9)
+    norm_trend = max(float(np.sum(np.abs(w_trend))), 1e-9)
+    norm_range = max(float(np.sum(np.abs(w_range))), 1e-9)
+
+    s_def   = sig_arr @ w_def   / norm_def    # (n,)
+    s_trend = sig_arr @ w_trend / norm_trend
+    s_range = sig_arr @ w_range / norm_range
+
+    if not regime_cfg.enabled:
+        return s_def
+
+    adx_v    = enriched["adx"].values if "adx" in enriched.columns else np.full(len(signal_matrix), np.nan)
+    is_na    = np.isnan(adx_v)
+    is_trend = (~is_na) & (adx_v >= regime_cfg.adx_trend_threshold)
+    is_range = (~is_na) & (adx_v <= regime_cfg.adx_range_threshold)
+
+    return np.where(is_na | (~is_trend & ~is_range), s_def,
+           np.where(is_trend, s_trend, s_range))
