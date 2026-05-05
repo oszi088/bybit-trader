@@ -49,7 +49,10 @@ logger = logging.getLogger("fetch")
 
 
 # Timeframe -> milliszekundum (a cursor-ugraskent hasznaljuk)
+# Megjegyzes: 1s adatot Binance-rol a fetch_binance_bulk.py toltsd le
+# (data.binance.vision bulk zip), nem CCXT-vel — az API nem nyujt 1s-t.
 TIMEFRAME_MS = {
+    "1s": 1_000,
     "1m": 60_000,        "3m": 180_000,       "5m": 300_000,
     "15m": 900_000,      "30m": 1_800_000,    "1h": 3_600_000,
     "2h": 7_200_000,     "4h": 14_400_000,    "6h": 21_600_000,

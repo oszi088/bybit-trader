@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from agent import Decision, TradingAgent
@@ -419,3 +420,260 @@ def walk_forward(
             break
         start += step
     return result
+
+
+# ============================================================================
+# Vektorizált SL/TP keresők (numpy, C-sebességű)
+# ============================================================================
+
+def _find_exit_bar_long(
+    lows: np.ndarray,
+    highs: np.ndarray,
+    sl: float,
+    tp: float,
+    start: int,
+    end: int,
+) -> Tuple[Optional[int], Optional[str], Optional[float]]:
+    """
+    Vektorizált előre-keresés long SL/TP találatra [start, end) tartományban.
+
+    Returns (bar_index, reason, fill_price) vagy (None, None, None) ha nincs találat.
+    A „same-bar tie" (SL és TP egyszerre teljesül) konzervatívan SL győz.
+    """
+    if start >= end:
+        return None, None, None
+    seg_low  = lows[start:end]
+    seg_high = highs[start:end]
+
+    sl_hits = np.where(seg_low  <= sl)[0]
+    tp_hits = np.where(seg_high >= tp)[0]
+
+    sl_idx = int(sl_hits[0]) if len(sl_hits) else (end - start)
+    tp_idx = int(tp_hits[0]) if len(tp_hits) else (end - start)
+
+    if sl_idx < tp_idx:
+        return start + sl_idx, "stop_loss",   sl
+    if tp_idx < sl_idx:
+        return start + tp_idx, "take_profit", tp
+    if sl_idx == tp_idx < (end - start):
+        return start + sl_idx, "stop_loss",   sl   # konzervatív
+    return None, None, None
+
+
+def _find_exit_bar_short(
+    lows: np.ndarray,
+    highs: np.ndarray,
+    sl: float,
+    tp: float,
+    start: int,
+    end: int,
+) -> Tuple[Optional[int], Optional[str], Optional[float]]:
+    """
+    Vektorizált előre-keresés short SL/TP találatra [start, end) tartományban.
+
+    Short SL: high >= sl (ár felülről üti a stopot)
+    Short TP: low  <= tp (ár leesett a célra)
+    """
+    if start >= end:
+        return None, None, None
+    seg_low  = lows[start:end]
+    seg_high = highs[start:end]
+
+    sl_hits = np.where(seg_high >= sl)[0]
+    tp_hits = np.where(seg_low  <= tp)[0]
+
+    sl_idx = int(sl_hits[0]) if len(sl_hits) else (end - start)
+    tp_idx = int(tp_hits[0]) if len(tp_hits) else (end - start)
+
+    if sl_idx < tp_idx:
+        return start + sl_idx, "stop_loss",   sl
+    if tp_idx < sl_idx:
+        return start + tp_idx, "take_profit", tp
+    if sl_idx == tp_idx < (end - start):
+        return start + sl_idx, "stop_loss",   sl
+    return None, None, None
+
+
+# ============================================================================
+# VectorizedBacktester
+# ============================================================================
+
+class VectorizedBacktester:
+    """
+    Gyors backteszter 1s / nagy adathalmazhoz (~100× Backtester-nél).
+
+    decide_at() per-bar hívás helyett vektorizált pipeline:
+      1. compute_all()                   — indikátorok (pandas rolling, vektorizált)
+      2. compute_signal_matrix()         — szignálmátrix egy numpy pass-ban
+      3. compute_scores_with_regime()    — np.dot batch score, ADX-alapú súlyváltással
+      4. Fő loop: O(N_trades), nem O(N_bars)
+      5. SL/TP keresés: numpy argwhere → O(K) C-loop a trade tartamán belül
+
+    Korlátok:
+      * Trailing stop NEM támogatott. Ha use_trailing_stop=True, automatikusan
+        a hagyományos Backtester fut le.
+      * Cycle params a prepare() egyszeri eredménye (nem változik bar-onként).
+      * Belépési feltételek: raw score küszöb + ATR/ár szűrő. Timing-blokkok,
+        altseason-szűrő és ML-prob-szűrő nem futnak (backtest sebesség miatt).
+      * MTF: ha be van töltve, a resample_ohlcv() előszámítja az adatot;
+        a composite_score azonban nem kerül a score-ba (nincs per-bar MTF call).
+    """
+
+    def __init__(self, agent: TradingAgent, config: Optional[TradingConfig] = None):
+        self.agent  = agent
+        self.config = config or agent.config
+
+    def run(self, ohlcv: pd.DataFrame) -> BacktestResult:
+        cfg = self.config
+
+        # Trailing stop: visszaesés a standard backtesterre
+        if cfg.stops.use_trailing_stop:
+            return Backtester(self.agent, cfg).run(ohlcv)
+
+        bt_cfg = cfg.backtest
+        stops  = cfg.stops
+
+        # ── 1. Indikátorok + előkészítés ─────────────────────────────────
+        if self.agent.mtf is not None:
+            for tf in self.agent.config.mtf.timeframes:
+                try:
+                    self.agent.mtf.set_data(tf, resample_ohlcv(ohlcv, tf))
+                except Exception:
+                    pass
+
+        enriched = self.agent.prepare(ohlcv)
+        n = len(enriched)
+        if n == 0:
+            return BacktestResult(pd.Series(dtype=float, name="equity"),
+                                  [], cfg.initial_balance, 0.0)
+
+        # ── 2. Vektorizált szignálmátrix + score ─────────────────────────
+        from signals import compute_signal_matrix, compute_scores_with_regime
+        from config import TREND_WEIGHTS, RANGE_WEIGHTS, DEFAULT_WEIGHTS
+
+        fg_value = self.agent._fg_for_ts(enriched.index[0])
+        sig_mat  = compute_signal_matrix(enriched, cfg.indicators, fg_value)
+        scores   = compute_scores_with_regime(
+            sig_mat, enriched, cfg.regime,
+            DEFAULT_WEIGHTS, TREND_WEIGHTS, RANGE_WEIGHTS,
+        )  # float64 array, len=n
+
+        # ── 3. Numpy price arrays ─────────────────────────────────────────
+        lows   = enriched["low"].values
+        highs  = enriched["high"].values
+        closes = enriched["close"].values
+        atrs   = enriched["atr"].values if "atr" in enriched.columns else np.zeros(n)
+
+        # ── 4. Ciklus-paraméterek (egyszer, az egész futásra) ─────────────
+        cycle_state = self.agent._cycle_state
+        if cycle_state is not None:
+            from adaptive_strategy import get_params
+            cp = get_params(cycle_state.cycle)
+        else:
+            cp = None
+        allow_long  = cp.allow_long        if cp else True
+        allow_short = cp.allow_short       if cp else False
+        max_hold    = cp.max_holding_bars  if cp else 9_999
+
+        # ── 5. Fő loop: skip-ahead pattern ───────────────────────────────
+        cash = float(cfg.initial_balance)
+        equity_arr = np.full(n, np.nan, dtype=np.float64)
+        trades: List[Trade] = []
+        i = 0
+
+        while i < n:
+            # ── Következő belépési jelölt megkeresése (numpy) ─────────────
+            rem_scores = scores[i:]
+            cand_long  = np.where(rem_scores >= cfg.buy_threshold)[0]  if allow_long  else np.array([], dtype=int)
+            cand_short = np.where(rem_scores <= cfg.sell_threshold)[0] if allow_short else np.array([], dtype=int)
+
+            first_long  = (i + int(cand_long[0]))  if len(cand_long)  else n
+            first_short = (i + int(cand_short[0])) if len(cand_short) else n
+
+            if first_long >= n and first_short >= n:
+                break   # nincs több belépés
+
+            entry_i = min(first_long, first_short)
+            direction = "long" if first_long <= first_short else "short"
+
+            # ── Kitöltjük a pozíció nélküli sávot ──────────────────────
+            equity_arr[i:entry_i] = cash
+
+            # ── Volatilitás-szűrő ────────────────────────────────────────
+            atr_v = float(atrs[entry_i]) if not np.isnan(atrs[entry_i]) else 0.0
+            price = float(closes[entry_i])
+            atr_pct = atr_v / price if price > 0 and atr_v > 0 else 0.0
+            if atr_pct >= cfg.risk.max_atr_pct or atr_v <= 0:
+                equity_arr[entry_i] = cash
+                i = entry_i + 1
+                continue
+
+            # ── Pozíció nyitása ──────────────────────────────────────────
+            score_v = float(scores[entry_i])
+            if direction == "long":
+                fill = _apply_slippage(price, "BUY", bt_cfg)
+                sl, tp = _initial_stops(fill, atr_v, stops)
+            else:
+                fill = _apply_slippage(price, "SELL", bt_cfg)
+                sl, tp = _initial_stops_short(fill, atr_v, stops)
+
+            size = _calc_size(fill, sl, cash, cfg, bt_cfg, score_v)
+            if size <= 0:
+                equity_arr[entry_i] = cash
+                i = entry_i + 1
+                continue
+
+            cash -= size * fill * (1.0 + cfg.fee_rate)   # = cash after buy
+            trade = Trade(
+                entry_time=enriched.index[entry_i],
+                entry_price=fill, size=size, direction=direction,
+            )
+
+            # ── Kilépés meghatározása (vektorizált) ───────────────────────
+            max_bar = min(entry_i + 1 + max_hold, n)
+
+            if direction == "long":
+                exit_i, reason, exit_fill = _find_exit_bar_long(
+                    lows, highs, sl, tp, entry_i + 1, max_bar)
+                sig_rev = np.where(scores[entry_i + 1:max_bar] <= cfg.sell_threshold)[0]
+            else:
+                exit_i, reason, exit_fill = _find_exit_bar_short(
+                    lows, highs, sl, tp, entry_i + 1, max_bar)
+                sig_rev = np.where(scores[entry_i + 1:max_bar] >= cfg.buy_threshold)[0]
+
+            sig_exit_i = (entry_i + 1 + int(sig_rev[0])) if len(sig_rev) else n
+
+            # SL/TP és signal exit közül a korábbi nyer
+            if exit_i is None:
+                if sig_exit_i < n:
+                    exit_i = sig_exit_i; reason = "signal"; exit_fill = float(closes[exit_i])
+                else:
+                    exit_i = max_bar - 1; reason = "max_holding"; exit_fill = float(closes[exit_i])
+            elif sig_exit_i < exit_i:
+                exit_i = sig_exit_i; reason = "signal"; exit_fill = float(closes[exit_i])
+
+            # ── Equity a trade alatt (vektorizált) ────────────────────────
+            # cash itt már post-buy; pozíció mark-to-market = cash + size * close
+            equity_arr[entry_i:exit_i + 1] = cash + size * closes[entry_i:exit_i + 1]
+
+            # ── Pozíció zárása ───────────────────────────────────────────
+            exit_ts = enriched.index[exit_i]
+            if direction == "long":
+                cash = _close_position(trade, exit_fill, exit_ts, cash, cfg, bt_cfg, reason)
+            else:
+                cash = _close_short(trade, exit_fill, exit_ts, cash, cfg, bt_cfg, reason)
+            equity_arr[exit_i] = cash   # post-close override az exit bárra
+            trades.append(trade)
+            i = exit_i + 1
+
+        # Kitöltjük a trade utáni maradék sávot
+        equity_arr[i:] = cash
+
+        # Nyitott pozíció zárása az adat végén (ha a last trade az utolsó bár)
+        # Ez a skip-ahead loopban nem fordulhat elő (max_hold védi), de biztonsági net:
+        if np.isnan(equity_arr[-1]):
+            equity_arr[np.isnan(equity_arr)] = cash
+
+        equity_curve = pd.Series(equity_arr, index=enriched.index, name="equity")
+        total_return_pct = (cash / cfg.initial_balance - 1) * 100
+        return BacktestResult(equity_curve, trades, cash, total_return_pct)
