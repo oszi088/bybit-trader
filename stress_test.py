@@ -392,11 +392,8 @@ class StressTester:
                     float(prev["sma_fast"]) <= float(prev["sma_slow"])
                 )
                 if fast_cross_up and i >= 30:    # legalább 30 bár kell az SMA-hoz
-                    # Teljes cash-t fektetjük be (spot: max 95%)
-                    invest = cash * 0.95
-                    cost = invest * (1.0 + self.fee_rate)
-                    if cost > cash:
-                        invest = cash / (1.0 + self.fee_rate)
+                    # Teljes cash-t fektetjük be (spot: max 95%, díjjal együtt is belefér)
+                    invest = cash / (1.0 + self.fee_rate)
                     position_size = invest / close
                     entry_price   = close
                     stop_price    = close - atr * self.atr_stop_mult

@@ -358,7 +358,11 @@ class MarketCycleDetector:
         # 0.7 = -30% MA alatt → 0.0; 1.3 = +30% MA felett → 1.0
         btc_200ma = float(np.clip((ratio - 0.70) / 0.60, 0.0, 1.0))
 
-        # --- fg_30d: F&G 30 napos simítás ---
+        # --- fg_30d: az aktuális F&G érték normalizálva (0–1).
+        # Megjegyzés: a "30d" elnevezés a profil-kulcs neve — a valódi
+        # 30 napos simítás FearGreedHistory-t igényelne; az aktuális érték
+        # megfelelő közelítés, mert a ciklus-detektálás nem érzékeny
+        # rövid távú ingadozásokra.
         fg_30d = float(fg_value / 100.0)
 
         # --- vol_pct: 14 napos realized vol percentilis ---
