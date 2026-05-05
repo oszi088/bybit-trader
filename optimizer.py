@@ -260,9 +260,17 @@ def optimize(
         cfg    = _apply_params(base_config, params)
 
         is_r = _run_one(cfg, is_data)
-        # Korai kizaras: IS nem jobb a default-nal → nem erdemli meg az OOS-t
-        if is_r.total_return_pct < default.is_return * 0.80:
-            continue
+        # Korai kizaras: IS nem jobb a default-nal → nem erdemli meg az OOS-t.
+        # Pozitív default: legalább 80% kell (pl. default=10% → min 8%).
+        # Negatív default (bear piac): a szorzó megfordítja az irányt, ezért
+        # külön ágban kezeljük: legfeljebb 20%-kal rosszabb veszteség megengedett
+        # (pl. default=-10% → min -12%), és semleges/pozitív eredmény mindig átmegy.
+        if default.is_return >= 0:
+            if is_r.total_return_pct < default.is_return * 0.80:
+                continue
+        else:
+            if is_r.total_return_pct < default.is_return * 1.20:
+                continue
 
         oos1_r = _run_one(cfg, oos1)
         oos2_r = _run_one(cfg, oos2)
