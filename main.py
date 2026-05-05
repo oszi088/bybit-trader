@@ -35,6 +35,7 @@ from ml_model import MLConfig, MetaLabelModel
 from ml_train import run_training
 from optimizer import optimize, DEFAULT_GRID, EXTENDED_GRID
 from portfolio import PortfolioTrader
+from portfolio_backtest import PortfolioBacktester
 from trader import build_bybit_trader, build_paper_trader
 
 
@@ -162,6 +163,55 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     print("\nLegjobb parameter-keszlet alkalmazashoz:")
     for k, v in best.params.items():
         print(f"  {k} = {v}")
+    return 0
+
+
+def cmd_portbt(args: argparse.Namespace) -> int:
+    """Portfolió-backteszt: megosztott tőke, párhuzamos multi-coin."""
+    import os, re
+    config = _build_config(args)
+
+    # CSV-ek betöltése a megadott mappából
+    data_dir = args.data_dir
+    pattern = re.compile(r"([A-Z]+)_USDT.*\.csv$", re.IGNORECASE)
+    datasets = {}
+    for fname in sorted(os.listdir(data_dir)):
+        m = pattern.match(fname)
+        if m:
+            sym = m.group(1).upper()
+            if args.symbols and sym not in [s.upper() for s in args.symbols.split(",")]:
+                continue
+            path = os.path.join(data_dir, fname)
+            datasets[sym] = load_csv(path)
+
+    if not datasets:
+        print(f"Nem talalhato CSV a mappaban: {data_dir}")
+        return 1
+
+    print(f"Betoltott coinok: {', '.join(sorted(datasets))} "
+          f"({sum(len(d) for d in datasets.values())} osszbar)")
+    print(f"Kezdotoke: ${args.initial_balance:,.0f} | "
+          f"Max pozicio: {args.max_positions} | "
+          f"Slot: ${args.initial_balance / args.max_positions:,.0f}")
+    print()
+
+    bt = PortfolioBacktester(
+        base_config=config,
+        initial_balance=args.initial_balance,
+        max_positions=args.max_positions,
+    )
+    result = bt.run(datasets)
+
+    print("=== PORTFOLIO BACKTEST EREDMENY ===")
+    print(result.summary())
+
+    if args.plot:
+        try:
+            import matplotlib.pyplot as plt
+            result.equity_curve.plot(title="Portfolio equity gorbe")
+            plt.tight_layout(); plt.show()
+        except ImportError:
+            print("(matplotlib nincs telepitve)")
     return 0
 
 
@@ -389,6 +439,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-combinations", type=int, default=300,
                    help="Max probalt parameter-kombinacio (default: 300)")
     p.set_defaults(func=cmd_optimize)
+
+    p = sub.add_parser("portbt",
+                       help="Portfolio-backteszt: megosztott toke, parhuzamos multi-coin")
+    p.add_argument("--data-dir", default="data",
+                   help="Mappa a CSV fajlokkal (default: data/)")
+    p.add_argument("--symbols", default=None,
+                   help="Vesszos coin lista szuroshoz, pl. BTC,ETH,SOL (default: mind)")
+    p.add_argument("--initial-balance", type=float, default=10_000.0,
+                   help="Kezdotoke USD-ban (default: 10000)")
+    p.add_argument("--max-positions", type=int, default=3,
+                   help="Max egyideju nyitott pozicio (default: 3)")
+    p.add_argument("--plot", action="store_true",
+                   help="Equity curve rajzolasa (matplotlib)")
+    p.add_argument("--symbol", default=None)
+    p.add_argument("--timeframe", default=None)
+    p.add_argument("--endpoint", choices=["eu", "global", "testnet"], default=None)
+    p.add_argument("--scalping", action="store_true")
+    p.set_defaults(func=cmd_portbt)
 
     p = sub.add_parser("paper")
     _add_runtime_flags(p)
