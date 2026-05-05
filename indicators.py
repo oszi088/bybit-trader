@@ -12,6 +12,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from orderbook_features import estimate_ob_imbalance_from_ohlcv
+
 
 # --------------------------------------------------------------------------- #
 # Trend indikátorok
@@ -238,5 +240,9 @@ def compute_all(df: pd.DataFrame, params) -> pd.DataFrame:
     out["vwap"] = vwap(df)
     out["mfi"] = mfi(df, params.mfi_period)
     out["vol_ma20"] = df["volume"].rolling(20, min_periods=1).mean()
+
+    # Orderflow proxy (backtesthez; élő kereskedésnél felülírja az agent)
+    out["ob_imbalance"]  = estimate_ob_imbalance_from_ohlcv(df)
+    out["ob_large_order"] = 0  # nincs historikus OB → semleges
 
     return out

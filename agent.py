@@ -25,10 +25,12 @@ from ml_features import build_feature_matrix
 from ml_model import MLScore, MetaLabelModel
 from mtf import MTFAnalyzer, MTFReading
 from regime import RegimeReading, detect_regime
+from orderbook_features import OrderBookFetcher
 from signals import (
     signal_adx, signal_atr, signal_bollinger, signal_cci,
     signal_ema_cross, signal_fear_greed, signal_macd, signal_mfi,
     signal_golden_death, signal_long_trend,
+    signal_ob_imbalance, signal_ob_large_order,
     signal_obv, signal_rsi, signal_sma_cross, signal_stochastic, signal_vwap,
 )
 
@@ -91,13 +93,19 @@ class TradingAgent:
                  ml_model: Optional[MetaLabelModel] = None,
                  cycle_detector: Optional[MarketCycleDetector] = None,
                  cycle_state_path: Optional[str] = "data/cycle_state.json",
-                 symbol: Optional[str] = None):
+                 symbol: Optional[str] = None,
+                 ob_fetcher: Optional[OrderBookFetcher] = None):
         self.config = config or TradingConfig()
         self._enriched: Optional[pd.DataFrame] = None
         self._features: Optional[pd.DataFrame] = None
         self._cycle_state: Optional[CycleState] = None
         self._altseason_result: Optional[ValidationResult] = None
         self._symbol = symbol   # aktuálisan kereskedett szimbólum
+
+        # Élő orderbook fetcher (None = backtest / nem elérhető)
+        self._ob_fetcher: Optional[OrderBookFetcher] = ob_fetcher
+        # Cache: egy döntési cikluson belül egyszer lekért OB feature-ök
+        self._live_ob_features: Optional[dict] = None
 
         # Historikus F&G lookup (ML train loophoz — lookahead mentesítés).
         # Ha meg van adva: decide_at() a gyertya dátumához tartozó értéket
@@ -149,22 +157,34 @@ class TradingAgent:
     def _gather_signals(self, row: pd.Series, prev_obv: Optional[float],
                         fg_value: int) -> Dict[str, int]:
         params = self.config.indicators
+
+        # Ha van élő OB fetcher, a row-t kibővítjük a friss OB feature-ökkel
+        # (csak ha már le lett kérve a _live_ob_features a decide() hívásban)
+        effective_row = row
+        if self._live_ob_features is not None:
+            effective_row = row.copy()
+            for k, v in self._live_ob_features.items():
+                effective_row[k] = v
+
         return {
-            "sma_cross":  signal_sma_cross(row),
-            "ema_cross":  signal_ema_cross(row),
-            "macd":       signal_macd(row),
-            "adx":        signal_adx(row),
-            "rsi":        signal_rsi(row, params),
-            "stochastic": signal_stochastic(row, params),
-            "cci":        signal_cci(row),
-            "bollinger":  signal_bollinger(row),
-            "atr":        signal_atr(row),
-            "obv":        signal_obv(row, prev_obv),
-            "vwap":       signal_vwap(row),
-            "mfi":        signal_mfi(row),
-            "fear_greed": signal_fear_greed(fg_value),
-            "golden_death": signal_golden_death(row),
-            "long_trend": signal_long_trend(row),
+            "sma_cross":    signal_sma_cross(effective_row),
+            "ema_cross":    signal_ema_cross(effective_row),
+            "macd":         signal_macd(effective_row),
+            "adx":          signal_adx(effective_row),
+            "rsi":          signal_rsi(effective_row, params),
+            "stochastic":   signal_stochastic(effective_row, params),
+            "cci":          signal_cci(effective_row),
+            "bollinger":    signal_bollinger(effective_row),
+            "atr":          signal_atr(effective_row),
+            "obv":          signal_obv(effective_row, prev_obv),
+            "vwap":         signal_vwap(effective_row),
+            "mfi":          signal_mfi(effective_row),
+            "fear_greed":   signal_fear_greed(fg_value),
+            "golden_death": signal_golden_death(effective_row),
+            "long_trend":   signal_long_trend(effective_row),
+            # Orderflow szignalok
+            "ob_imbalance":   signal_ob_imbalance(effective_row),
+            "ob_large_order": signal_ob_large_order(effective_row),
         }
 
     def _aggregate(self, signals: Dict[str, int], weights: Dict[str, float],
@@ -449,4 +469,28 @@ class TradingAgent:
 
     def decide(self, ohlcv: pd.DataFrame) -> Decision:
         self.prepare(ohlcv)
-        return self.decide_at(len(ohlcv) - 1)
+
+        # Élő kereskedésben: OB lekérés és cache reset döntés előtt
+        if self._ob_fetcher is not None:
+            raw = self._ob_fetcher.feature_dict()
+            # Normalizálás: az ob_imbalance_10 → ob_imbalance (amit a signal-ok keresnek)
+            self._live_ob_features = {
+                "ob_imbalance":  raw.get("ob_imbalance_10", 0.0),
+                "ob_large_order": raw.get("ob_large_order", 0),
+                # extra meta (loghoz, de signal nem használja)
+                "ob_imbalance_20":   raw.get("ob_imbalance_20", 0.0),
+                "ob_depth_ratio_20": raw.get("ob_depth_ratio_20", 1.0),
+                "ob_spread_pct":     raw.get("ob_spread_pct", 0.0),
+            }
+            logger.debug(
+                "OB features: imb=%.3f large=%d spread=%.5f",
+                self._live_ob_features["ob_imbalance"],
+                self._live_ob_features["ob_large_order"],
+                self._live_ob_features["ob_spread_pct"],
+            )
+        else:
+            self._live_ob_features = None
+
+        decision = self.decide_at(len(ohlcv) - 1)
+        self._live_ob_features = None   # döntés után töröljük a cache-t
+        return decision

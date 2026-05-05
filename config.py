@@ -75,6 +75,9 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
     "fear_greed": 0.8,
     "golden_death": 1.5,
     "long_trend": 0.7,
+    # Orderflow
+    "ob_imbalance":   1.2,
+    "ob_large_order": 0.8,
 }
 
 # Trend rezsimben a trendkoveto indikatorok dominalnak
@@ -86,6 +89,9 @@ TREND_WEIGHTS: Dict[str, float] = {
     "fear_greed": 0.5,
     "golden_death": 1.5,
     "long_trend": 1.0,
+    # Trendben az OBI fontos (impulzus megerosites)
+    "ob_imbalance":   1.5,
+    "ob_large_order": 1.0,
 }
 
 # Range/sav rezsimben a mean-reversion indikatorok dominalnak
@@ -97,6 +103,9 @@ RANGE_WEIGHTS: Dict[str, float] = {
     "fear_greed": 1.2,
     "golden_death": 1.0,
     "long_trend": 0.3,
+    # Range-ben az OBI kevesbe megbizhatو, de large_order wall szint fontos
+    "ob_imbalance":   0.8,
+    "ob_large_order": 1.2,
 }
 
 # Scalping rezsim sub-5min timeframe-ekhez:
@@ -112,6 +121,9 @@ SCALPING_WEIGHTS: Dict[str, float] = {
     "fear_greed": 0.2,
     "golden_death": 0.2,
     "long_trend": 0.2,
+    # Scalpingban az OBI a legfontosabb mikrostruktura signal
+    "ob_imbalance":   2.0,
+    "ob_large_order": 1.5,
 }
 
 

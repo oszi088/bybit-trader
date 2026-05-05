@@ -234,3 +234,39 @@ def signal_long_trend(row: pd.Series) -> int:
     if s < l:
         return -1
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Orderflow / mikrostruktura szignalok
+# --------------------------------------------------------------------------- #
+
+def signal_ob_imbalance(row: pd.Series) -> int:
+    """
+    Order Book Imbalance (OBI) alapu szignal.
+    Backtestben OHLCV-proxyt hasznal (estimate_ob_imbalance_from_ohlcv),
+    elo kereskedésben a valodi L2 orderbook erteket.
+
+    Kuszob: |OBI| > 0.20 → iranyt ad; kisebbnel semleges.
+    Indoklas: az OBI zajos proxy, csak egyertelmu imbalancet ertekeljuk.
+    """
+    v = row.get("ob_imbalance", 0.0)
+    if v is None or pd.isna(v):
+        return 0
+    if v > 0.20:
+        return 1
+    if v < -0.20:
+        return -1
+    return 0
+
+
+def signal_ob_large_order(row: pd.Series) -> int:
+    """
+    Nagy limit megbizas (intezmenyi fal) szignalra forditva.
+    Ertekek: +1 (veteli fal), 0 (semleges), -1 (eladasi fal).
+    Backtestben mindig 0 (nincs historikus OB), elo kereskedésben
+    az OrderBookFetcher.feature_dict() toltí ki.
+    """
+    v = row.get("ob_large_order", 0)
+    if v is None or pd.isna(v):
+        return 0
+    return int(v)
