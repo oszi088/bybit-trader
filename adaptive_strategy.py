@@ -288,9 +288,9 @@ def apply_to_config(config, params: CycleRegimeParams) -> None:
     A base config értékei elvesznek — mindig az eredeti config-ból
     kell meghívni (ne lancolja a hívásokat).
     """
-    # Stop/TP szorzók
-    config.risk.atr_stop_mult = params.atr_stop_mult
-    config.risk.atr_tp_mult   = params.atr_tp_mult
+    # Stop/TP szorzók — config.stops-ba kell írni, NEM config.risk-be!
+    config.stops.atr_stop_mult = params.atr_stop_mult
+    config.stops.atr_tp_mult   = params.atr_tp_mult
 
     # Buy/Sell küszöb módosítása
     config.buy_threshold  = config.buy_threshold  + params.score_threshold_delta

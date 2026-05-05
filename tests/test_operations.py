@@ -761,8 +761,8 @@ class TestAdaptiveStrategy:
         cfg = TradingConfig()
         params = get_params(MarketCycle.BULL_LATE)
         apply_to_config(cfg, params)
-        assert cfg.risk.atr_stop_mult == pytest.approx(params.atr_stop_mult)
-        assert cfg.risk.atr_tp_mult   == pytest.approx(params.atr_tp_mult)
+        assert cfg.stops.atr_stop_mult == pytest.approx(params.atr_stop_mult)
+        assert cfg.stops.atr_tp_mult   == pytest.approx(params.atr_tp_mult)
 
     def test_describe_contains_cycle_name(self):
         assert "ACCUMULATION" in describe(MarketCycle.ACCUMULATION).upper()
