@@ -13,13 +13,13 @@ Bovitesek:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 from agent import Decision, TradingAgent
-from config import TradingConfig
+from config import ScaleInConfig, TradingConfig
 from mtf import resample_ohlcv
 
 
@@ -677,3 +677,347 @@ class VectorizedBacktester:
         equity_curve = pd.Series(equity_arr, index=enriched.index, name="equity")
         total_return_pct = (cash / cfg.initial_balance - 1) * 100
         return BacktestResult(equity_curve, trades, cash, total_return_pct)
+
+
+# ============================================================================
+# Portfolio backteszter — párhuzamos multi-symbol figyelés + scale-in
+# ============================================================================
+
+@dataclass
+class _OpenPos:
+    """Belső állapot egy nyitott portfolió-pozícióhoz."""
+    sym: str
+    direction: str       # "long" | "short"
+    entry_i: int         # bársorszám a szimbólum saját indexén
+    sl: float
+    tp: float
+    size: float          # jelenlegi összesített mennyiség (tranche-ok után)
+    trade: Trade
+    tranche_idx: int     # hány tranche-t vettünk már
+    last_buy_price: float
+    next_dca_bar: Optional[int] = None  # cache: köv. scale-in trigger bar (O(1) lookup)
+
+
+@dataclass
+class PortfolioBacktestResult:
+    """
+    Portfolió backteszt eredménye.
+
+    Tartalmaz:
+      combined_equity  — közös cash + mark-to-market equity görbe
+      per_symbol       — szimbólumok szerinti trade-lista + hozam
+      all_trades       — összes kötés időrendi sorrendben
+      final_balance    — végső egyenleg
+      total_return_pct — százalékos hozam
+    """
+    combined_equity: pd.Series
+    per_symbol: Dict[str, List[Trade]]
+    all_trades: List[Trade]
+    final_balance: float
+    total_return_pct: float
+
+    def summary(self) -> str:
+        wins = [t for t in self.all_trades if t.pnl > 0]
+        win_rate = len(wins) / len(self.all_trades) * 100 if self.all_trades else 0.0
+        max_dd = _max_drawdown(self.combined_equity)
+        by_sym = {s: len(ts) for s, ts in self.per_symbol.items() if ts}
+        return (
+            f"Trades: {len(self.all_trades)} {by_sym} | "
+            f"Win rate: {win_rate:.1f}% | "
+            f"Final: ${self.final_balance:,.2f} | "
+            f"Return: {self.total_return_pct:+.2f}% | "
+            f"Max DD: {max_dd:.1f}%"
+        )
+
+
+class PortfolioBacktester:
+    """
+    Párhuzamos multi-symbol backteszter.
+
+    Algoritmus:
+      1. Minden szimbólumra előszámítja a vektorizált score-tömböt egyszer
+         (compute_signal_matrix + compute_scores_with_regime).
+      2. Event-driven skip-ahead loop:
+         - Ha nincs nyitott pozíció: numpy.where -> ugrás a következő entry jelre
+         - Ha van nyitott pozíció: _find_exit_bar_long/short -> leghamarabb kiváltódó
+           SL/TP eseményhez ugrik; közben vectorized mark-to-market equity kitöltés
+      3. ScaleIn:
+         - "dca" mode: ha az ár lesüllyed trigger_pct-tel az utolsó vásárláshoz képest,
+           új tranche vásárlása (átlagolás lefelé)
+         - "pyramid" mode: ha az ár felemelkedik trigger_pct-tel, hozzáad a pozícióhoz
+
+    max_concurrent: egyszerre hány szimbólum tarthat nyitott pozíciót.
+    """
+
+    def __init__(
+        self,
+        agents: Dict[str, TradingAgent],
+        config: TradingConfig,
+        max_concurrent: int = 3,
+        scale_in: Optional[ScaleInConfig] = None,
+    ):
+        self.agents = agents
+        self.config = config
+        self.max_concurrent = max_concurrent
+        self.scale_in = scale_in or config.scale_in
+
+    # ------------------------------------------------------------------
+    # Segéd: score-tömb előszámítása egy szimbólumra
+    # ------------------------------------------------------------------
+
+    def _precompute(self, sym: str, ohlcv: pd.DataFrame) -> dict:
+        from signals import compute_signal_matrix, compute_scores_with_regime
+        from config import DEFAULT_WEIGHTS, TREND_WEIGHTS, RANGE_WEIGHTS
+
+        agent = self.agents[sym]
+        cfg = self.config
+        enriched = agent.prepare(ohlcv)
+        n = len(enriched)
+        fg = agent._fg_for_ts(enriched.index[0])
+        sig_mat = compute_signal_matrix(enriched, cfg.indicators, fg)
+        scores = compute_scores_with_regime(
+            sig_mat, enriched, cfg.regime,
+            DEFAULT_WEIGHTS, TREND_WEIGHTS, RANGE_WEIGHTS,
+        )
+        return {
+            "enriched": enriched,
+            "scores":   scores,
+            "lows":     enriched["low"].values.astype(np.float64),
+            "highs":    enriched["high"].values.astype(np.float64),
+            "closes":   enriched["close"].values.astype(np.float64),
+            "atrs":     (enriched["atr"].values.astype(np.float64)
+                         if "atr" in enriched.columns else np.zeros(n)),
+            "n":        n,
+        }
+
+    # ------------------------------------------------------------------
+    # DCA / pyramid trigger bar keresése
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_scale_trigger(closes: np.ndarray, last_price: float,
+                            trigger_pct: float, mode: str,
+                            start: int, end: int) -> Optional[int]:
+        """Visszaadja az első bar indexét ahol a scale-in feltétel teljesül."""
+        seg = closes[start:end]
+        if mode == "dca":
+            thresh = last_price * (1.0 - trigger_pct)
+            hits = np.where(seg <= thresh)[0]
+        else:  # pyramid
+            thresh = last_price * (1.0 + trigger_pct)
+            hits = np.where(seg >= thresh)[0]
+        return (start + int(hits[0])) if len(hits) else None
+
+    # ------------------------------------------------------------------
+    # Fő futtatás
+    # ------------------------------------------------------------------
+
+    def run(self, ohlcv_dict: Dict[str, pd.DataFrame]) -> PortfolioBacktestResult:
+        cfg = self.config
+        bt_cfg = cfg.backtest
+        stops = cfg.stops
+        sc = self.scale_in
+        symbols = list(ohlcv_dict.keys())
+
+        # 1. Előszámítás minden szimbólumra
+        sym_data: Dict[str, dict] = {}
+        for sym in symbols:
+            sym_data[sym] = self._precompute(sym, ohlcv_dict[sym])
+
+        # Közös hossz: rövidebb szimbólumhoz igazítunk
+        n = min(d["n"] for d in sym_data.values())
+        # Közös idő-index (az első szimbólum alapján)
+        common_index = sym_data[symbols[0]]["enriched"].index[:n]
+
+        # 2. Inicializálás
+        cash = float(cfg.initial_balance)
+        open_pos: Dict[str, _OpenPos] = {}   # sym -> _OpenPos
+        all_trades: List[Trade] = []
+        per_symbol: Dict[str, List[Trade]] = {s: [] for s in symbols}
+        equity_arr = np.full(n, np.nan, dtype=np.float64)
+        i = 0
+
+        def _mtm_at(bar: int) -> float:
+            return sum(
+                p.size * float(sym_data[p.sym]["closes"][bar])
+                for p in open_pos.values()
+            )
+
+        def _open_new(sym: str, bar: int, score: float) -> None:
+            nonlocal cash
+            d = sym_data[sym]
+            price = float(d["closes"][bar])
+            atr_v = float(d["atrs"][bar])
+            if atr_v <= 0 or price <= 0:
+                return
+            fill = _apply_slippage(price, "BUY", bt_cfg)
+            sl, tp = _initial_stops(fill, atr_v, stops)
+            if sc.enabled:
+                alloc = cash * sc.first_tranche_pct
+                size = alloc / (fill * (1.0 + cfg.fee_rate))
+            else:
+                size = _calc_size(fill, sl, cash, cfg, bt_cfg, abs(score))
+            if size <= 0:
+                return
+            cost = size * fill * (1.0 + cfg.fee_rate)
+            if cost > cash:
+                return
+            cash -= cost
+            trade = Trade(
+                entry_time=d["enriched"].index[bar],
+                entry_price=fill,
+                size=size,
+                direction="long",
+            )
+            open_pos[sym] = _OpenPos(
+                sym=sym, direction="long",
+                entry_i=bar, sl=sl, tp=tp,
+                size=size, trade=trade,
+                tranche_idx=1, last_buy_price=fill,
+            )
+
+        def _close(sym: str, pos: _OpenPos, fill: float, bar: int, reason: str) -> None:
+            nonlocal cash
+            d = sym_data[sym]
+            ts = d["enriched"].index[bar]
+            cash = _close_position(pos.trade, fill, ts, cash, cfg, bt_cfg, reason)
+            all_trades.append(pos.trade)
+            per_symbol[sym].append(pos.trade)
+            del open_pos[sym]
+
+        while i < n:
+            # ── A) Kilépések az aktuális bárra ──────────────────────────
+            to_close = []
+            for sym, pos in open_pos.items():
+                d = sym_data[sym]
+                low_i  = float(d["lows"][i])
+                high_i = float(d["highs"][i])
+                if low_i <= pos.sl:
+                    to_close.append((sym, pos, pos.sl, "stop_loss"))
+                elif high_i >= pos.tp:
+                    to_close.append((sym, pos, pos.tp, "take_profit"))
+            for sym, pos, fill, reason in to_close:
+                _close(sym, pos, fill, i, reason)
+
+            # ── B) Scale-in ──────────────────────────────────────────────
+            if sc.enabled:
+                for sym, pos in list(open_pos.items()):
+                    if pos.tranche_idx >= sc.n_tranches:
+                        continue
+                    curr = float(sym_data[sym]["closes"][i])
+                    if sc.mode == "dca":
+                        triggered = curr <= pos.last_buy_price * (1.0 - sc.trigger_pct)
+                    else:
+                        triggered = curr >= pos.last_buy_price * (1.0 + sc.trigger_pct)
+                    if triggered:
+                        alloc = cash * sc.add_tranche_pct
+                        add_fill = _apply_slippage(curr, "BUY", bt_cfg)
+                        add_size = alloc / (add_fill * (1.0 + cfg.fee_rate))
+                        cost = add_size * add_fill * (1.0 + cfg.fee_rate)
+                        if add_size > 0 and cost <= cash:
+                            cash -= cost
+                            pos.size += add_size
+                            pos.tranche_idx += 1
+                            pos.last_buy_price = add_fill
+
+            # ── C) Új belépések ──────────────────────────────────────────
+            while len(open_pos) < self.max_concurrent:
+                avail = [s for s in symbols if s not in open_pos]
+                if not avail:
+                    break
+                best_sym: Optional[str] = None
+                best_score = cfg.buy_threshold - 1e-9
+                for sym in avail:
+                    s = float(sym_data[sym]["scores"][i])
+                    if s > best_score:
+                        best_score = s
+                        best_sym = sym
+                if best_sym is None:
+                    break
+                _open_new(best_sym, i, best_score)
+                if best_sym not in open_pos:
+                    break  # nem sikerült (pl. nincs elég cash)
+
+            # ── D) Equity ────────────────────────────────────────────────
+            equity_arr[i] = cash + _mtm_at(i)
+
+            # ── E) Skip-ahead ────────────────────────────────────────────
+            if not open_pos:
+                min_next = n
+                for sym in symbols:
+                    scr = sym_data[sym]["scores"]
+                    cands = np.where(scr[i + 1:] >= cfg.buy_threshold)[0]
+                    if len(cands):
+                        min_next = min(min_next, i + 1 + int(cands[0]))
+                if min_next >= n:
+                    equity_arr[i:] = cash
+                    break
+                equity_arr[i + 1:min_next] = cash
+                i = min_next
+            else:
+                # SL/TP / scale-trigger / új entry közül legkorábbi
+                events: List[Tuple[int, str, str, float]] = []
+
+                for sym, pos in open_pos.items():
+                    d = sym_data[sym]
+                    ex_i, ex_r, ex_f = _find_exit_bar_long(
+                        d["lows"], d["highs"], pos.sl, pos.tp, i + 1, n)
+                    if ex_i is None:
+                        ex_i = n - 1; ex_r = "max_holding"
+                        ex_f = float(d["closes"][n - 1])
+                    events.append((ex_i, "exit", sym, ex_f))
+
+                    if sc.enabled and pos.tranche_idx < sc.n_tranches:
+                        trig_i = self._find_scale_trigger(
+                            d["closes"], pos.last_buy_price,
+                            sc.trigger_pct, sc.mode, i + 1, n)
+                        if trig_i is not None:
+                            events.append((trig_i, "scale", sym,
+                                           float(d["closes"][trig_i])))
+
+                if len(open_pos) < self.max_concurrent:
+                    for sym in symbols:
+                        if sym not in open_pos:
+                            scr = sym_data[sym]["scores"]
+                            cands = np.where(scr[i + 1:] >= cfg.buy_threshold)[0]
+                            if len(cands):
+                                e_i = i + 1 + int(cands[0])
+                                events.append((e_i, "entry", sym,
+                                               float(scr[e_i])))
+
+                if not events:
+                    equity_arr[i:] = cash + _mtm_at(i)
+                    break
+
+                next_i = min(ev[0] for ev in events)
+
+                # Vektorizált equity kitöltés i+1 .. next_i-1
+                if next_i > i + 1:
+                    eq_seg = np.full(next_i - i - 1, cash)
+                    for sym, pos in open_pos.items():
+                        eq_seg += pos.size * sym_data[sym]["closes"][i + 1:next_i]
+                    equity_arr[i + 1:next_i] = eq_seg
+
+                i = next_i
+
+        # Maradék NaN kitöltés
+        if np.any(np.isnan(equity_arr)):
+            last_val = cash + _mtm_at(min(i, n - 1)) if i < n else cash
+            equity_arr[np.isnan(equity_arr)] = last_val
+
+        # Nyitott pozíciók lezárása az adatsor végén
+        for sym, pos in list(open_pos.items()):
+            fill = float(sym_data[sym]["closes"][n - 1])
+            _close(sym, pos, fill, n - 1, "end_of_data")
+
+        equity_arr[-1] = cash
+
+        equity_curve = pd.Series(equity_arr, index=common_index, name="equity")
+        total_return_pct = (cash / cfg.initial_balance - 1) * 100
+        return PortfolioBacktestResult(
+            combined_equity=equity_curve,
+            per_symbol=per_symbol,
+            all_trades=all_trades,
+            final_balance=cash,
+            total_return_pct=total_return_pct,
+        )
