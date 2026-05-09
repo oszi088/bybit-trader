@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-holding", type=int, default=20,
                    help="Maximális tartási idő gyertyában (embargo alap)")
 
+    # --- Jel küszöb ---
+    p.add_argument("--threshold", type=float, default=0.20,
+                   help="Elsődleges jel küszöb (buy_threshold). "
+                        "0.50 nagyon szűrős 1h-n, 0.20 kb. 300+ signal")
+
     # --- Ensemble bekapcsolók ---
     p.add_argument("--no-catboost",  action="store_true",
                    help="CatBoost kihagyása az ensemble-ből")
@@ -161,8 +166,10 @@ def main() -> None:
     from ml_train import run_training
 
     cfg = TradingConfig()
-    cfg.symbol    = args.symbol
-    cfg.timeframe = args.timeframe
+    cfg.symbol         = args.symbol
+    cfg.timeframe      = args.timeframe
+    cfg.buy_threshold  = args.threshold
+    cfg.sell_threshold = -args.threshold
 
     ml_cfg = MLConfig(
         model_path          = args.out,
